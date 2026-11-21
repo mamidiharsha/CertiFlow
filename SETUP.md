@@ -1,178 +1,181 @@
-# CertiFlow — Setup Guide
+# CertiFlow Setup Guide
 
-## Prerequisites
+This guide covers the recommended Docker setup and an optional development setup with hot reload. The Docker route is closest to the demo environment.
 
-| Tool             | Version | Purpose                     |
-| ---------------- | ------- | --------------------------- |
-| **Node.js**      | 20+     | Backend & frontend runtime  |
-| **npm**          | 9+      | Package manager             |
-| **Docker**       | 24+     | Container runtime           |
-| **Docker Compose** | v2+   | Multi-container orchestration |
+## Requirements
 
----
+- Docker Desktop with Docker Compose v2.
+- Node.js 20+ and npm 9+ only if using the development setup or running backend tests outside Docker.
+- Ports 80, 3000, 3001, 5432, and 6379 available for the full Docker setup.
 
-## Option 1 — Quick Start with Docker (Recommended)
+## Run the complete application with Docker
 
-One command starts the entire stack: PostgreSQL, Redis, backend, frontend, WhatsApp mock, and seeds demo data.
+1. Open PowerShell in the repository folder:
 
-```bash
-docker compose up --build
+   ```powershell
+   Set-Location C:\path\to\CertiFlow
+   ```
+
+2. Build the images and start the services:
+
+   ```powershell
+   docker compose up --build
+   ```
+
+   To run it in the background instead:
+
+   ```powershell
+   docker compose up --build -d
+   ```
+
+3. Wait until the `seed` service reports `Seed completed`. It applies Prisma migrations and creates the demo users. The seed container then exits successfully; that is expected.
+
+4. Open the application at [http://localhost](http://localhost).
+
+| Address | Purpose |
+| --- | --- |
+| [http://localhost](http://localhost) | Web application |
+| [http://localhost/verify](http://localhost/verify) | Public certificate verification |
+| [http://localhost:3000/api/health](http://localhost:3000/api/health) | Backend health check |
+| [http://localhost:3001/health](http://localhost:3001/health) | WhatsApp mock health check |
+
+### Stop the application
+
+Use `Ctrl+C` if Compose is running in the foreground. If it is running in the background:
+
+```powershell
+docker compose down
 ```
 
-| URL                        | Service              |
-| -------------------------- | -------------------- |
-| http://localhost            | Frontend (via Nginx) |
-| http://localhost:3000       | Backend API          |
-| http://localhost:3001       | WhatsApp Mock        |
-| http://localhost/verify     | Public Verification  |
+This keeps named volumes, including database data and generated PDFs. **Do not add `-v` unless you intend to delete those volumes and their data.**
 
-The `seed` container runs once at startup, applies migrations, and loads demo data.  
-Wait for the log line `✅ Seed completed` before using the app.
+## Demo credentials and walkthrough
 
----
+Every seeded user uses the password `password123`. You can sign in with these accounts or use the demo user switcher in the app.
 
-## Option 2 — Development Setup (Hot Reload)
+| Name | Email | Role |
+| --- | --- | --- |
+| Anika | `anika@certiflow.in` | Training centre |
+| Dev | `dev@certiflow.in` | District officer |
+| Meera | `meera@certiflow.in` | District officer |
+| Kabir | `kabir@certiflow.in` | District officer |
+| Neha | `neha@certiflow.in` | Quality team |
+| Farah | `farah@certiflow.in` | State office |
 
-### 1. Start infrastructure services
+Suggested demo:
 
-```bash
-docker compose -f docker-compose.dev.yml up -d
-```
+1. Sign in as Anika. Upload a spreadsheet and submit the resulting batch for approval. Required columns are `name`, `phone`, `course`, and `score`; use a 10-digit phone number and a score from 0 to 100. Invalid rows are reported, and the batch is not partially saved.
+2. Open that batch as Dev and approve it.
+3. Switch to Meera and approve the same batch. Two different district officers are required.
+4. For a batch with 50 or more candidates, switch to Neha and approve it at quality review. Smaller batches skip this stage.
+5. Switch to Farah and give final approval. Certificate creation and WhatsApp delivery are background tasks, so allow a short time for them to complete.
+6. Look up the certificate number in the certificate list, then verify it at [http://localhost/verify](http://localhost/verify) without signing in.
+7. Optionally test sending a batch back for correction and resubmitting it as Anika. On resubmission, prior decisions remain in the audit history but are marked superseded, and the approval process restarts with district review.
+8. Optionally cancel an issued certificate as Farah and verify it again. The public page should report that it is cancelled.
 
-This starts PostgreSQL (port 5432) and Redis (port 6379) only.
+The WhatsApp mock deliberately simulates delivery failures and timeouts. Check delivery status in the application and use the available retry action if a delivery fails.
 
-### 2. Start the backend
+## Development setup (hot reload)
 
-```bash
-cd backend
-npm install
-npx prisma migrate deploy
-npx prisma db seed
-npm run dev
-```
+Use this route if you want to run the frontend and backend directly on your machine while Docker provides PostgreSQL and Redis.
 
-Backend is running at **http://localhost:3000**.
+1. Start the development infrastructure from the repository root:
 
-### 3. Start the frontend
+   ```powershell
+   docker compose -f docker-compose.dev.yml up -d
+   ```
 
-```bash
-cd frontend
-npm install
-npm run dev
-```
+2. In a new PowerShell window, configure and start the backend:
 
-Frontend is running at **http://localhost:5173** (Vite dev server with hot reload).  
-The Vite config proxies `/api` to the backend automatically.
+   ```powershell
+   Set-Location C:\path\to\CertiFlow\backend
+   Copy-Item .env.example .env
+   npm install
+   npx prisma migrate deploy
+   npx prisma db seed
+   npm run dev
+   ```
 
-### 4. (Optional) Start the WhatsApp mock
+   The backend listens at `http://localhost:3000`.
 
-```bash
-cd backend
-npm run mock-whatsapp
-```
+3. In another PowerShell window, start the frontend:
 
-WhatsApp mock is running at **http://localhost:3001**.
+   ```powershell
+   Set-Location C:\path\to\CertiFlow\frontend
+   npm install
+   npm run dev
+   ```
 
----
+   Open the Vite URL printed in the terminal (normally `http://localhost:5173`). The Vite configuration proxies API requests to the backend.
 
-## Running Tests
+4. If you want to exercise background WhatsApp delivery in development, start the mock in another window:
 
-```bash
-cd backend
+   ```powershell
+   Set-Location C:\path\to\CertiFlow\backend
+   npm run mock-whatsapp
+   ```
+
+   The mock listens at `http://localhost:3001`. Ensure the backend `.env` points `WHATSAPP_API_URL` at this local mock.
+
+## Run backend checks
+
+```powershell
+Set-Location C:\path\to\CertiFlow\backend
 npm test
+npm run build
 ```
 
-Tests use Vitest and cover the approval workflow, certificate generation, and API endpoints.
+To validate the Prisma schema:
 
----
-
-## Demo Users
-
-All demo users share the password **`password123`**.  
-You can also use the **Demo User Switcher** (floating panel in the bottom-right corner) to switch instantly.
-
-| Name     | Email                | Role               | Scope                       |
-| -------- | -------------------- | ------------------ | --------------------------- |
-| Anika    | anika@certiflow.in   | CENTRE             | Pragati Skills Academy, Pune |
-| Dev      | dev@certiflow.in     | DISTRICT_OFFICER   | Pune district               |
-| Meera    | meera@certiflow.in   | DISTRICT_OFFICER   | Pune district               |
-| Kabir    | kabir@certiflow.in   | DISTRICT_OFFICER   | Pune district               |
-| Neha     | neha@certiflow.in    | QUALITY_TEAM       | All large batches           |
-| Farah    | farah@certiflow.in   | STATE_OFFICE       | All batches (final approval)|
-
-### Demo Walk-through
-
-1. **Log in as Anika** → Upload an Excel file or view the pre-seeded batches → Submit for approval.
-2. **Switch to Dev** → Review the batch → Approve.
-3. **Switch to Meera** → Approve the same batch (quorum = 2 district officers).
-4. If the batch has ≥ 50 candidates, **switch to Neha** → Quality review → Approve.
-5. **Switch to Farah** → Final state approval → Certificates are generated and delivered.
-6. Open **http://localhost/verify** → Enter a certificate number to verify.
-
----
-
-## Environment Variables
-
-Copy the example file and customise if needed:
-
-```bash
-cp .env.example .env
+```powershell
+npx prisma validate
 ```
-
-See [`.env.example`](.env.example) for all variables and their defaults.
-
----
 
 ## Troubleshooting
 
-### Port already in use
+### Docker is not recognized or unavailable
 
-```bash
-# Check what is using the port
-# Windows
-netstat -ano | findstr :3000
-# macOS / Linux
-lsof -i :3000
+Start Docker Desktop, wait until its engine is running, then open a new PowerShell terminal and check:
+
+```powershell
+docker version
+docker compose version
 ```
 
-### Database connection refused
+### Check containers and logs
 
-Make sure PostgreSQL is running:
-
-```bash
-docker compose -f docker-compose.dev.yml ps
+```powershell
+docker compose ps --all
+docker compose logs --tail 100 seed backend frontend
 ```
 
-If the container is not healthy, check logs:
+The `seed` service should exit with code 0 after migrations and demo data are applied. Backend and frontend should remain running.
 
-```bash
-docker compose -f docker-compose.dev.yml logs postgres
+### A port is already in use
+
+Check the port (for example, port 3000) in PowerShell:
+
+```powershell
+Get-NetTCPConnection -LocalPort 3000 -ErrorAction SilentlyContinue
 ```
 
-### Prisma migration errors
+Stop the conflicting application or adjust the host-side port mapping in `docker-compose.yml`.
 
-Reset the database and re-seed:
+### Build or startup problem
 
-```bash
-cd backend
-npx prisma migrate reset --force
+Review the relevant service logs, then rebuild without deleting stored data:
+
+```powershell
+docker compose down
+docker compose up --build
 ```
 
-### Docker build fails
+`docker compose down -v` deletes the database, Redis, and generated-certificate volumes. Use it only when intentionally resetting the local environment.
 
-Clear Docker cache and rebuild:
+### WhatsApp delivery does not succeed immediately
 
-```bash
-docker compose down -v
-docker compose up --build --force-recreate
-```
+This is expected sometimes: the local mock intentionally simulates failures and timeouts. Check delivery status and backend logs; retry from the state-office certificate screen when available.
 
-### SSE events not arriving
+### Live updates are missing
 
-- Check that the backend is running and healthy.
-- In production (Docker), nginx must be configured without buffering for `/api/events/` — this is already handled in the provided `nginx.conf`.
-- In dev mode, the Vite proxy handles SSE forwarding automatically.
-
-### WhatsApp mock not responding
-
-The mock server randomly returns errors (~30% of the time) on purpose to test retry logic. Check the backend logs for BullMQ retry behaviour.
+Check that the backend is running. Notifications are best-effort while connected; after reconnecting, the application refreshes its current data.

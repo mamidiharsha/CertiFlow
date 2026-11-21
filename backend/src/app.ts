@@ -18,7 +18,8 @@ app.use(cors({
   credentials: true,
 }));
 app.use(helmet());
-app.use(morgan('dev'));
+morgan.token('safe-url', (req) => (req.url || '').replace(/([?&]token=)[^&]+/gi, '$1[redacted]'));
+app.use(morgan(':method :safe-url :status :response-time ms - :res[content-length]'));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());

@@ -1,6 +1,6 @@
 import app from './app';
 import { config } from './config';
-import { setupSlaRepeatable } from './queues';
+import { setupCertificateReconciliation, setupDeliveryReconciliation, setupSlaRepeatable } from './queues';
 import { startCertificateWorker } from './workers/certificate.worker';
 import { startWhatsAppWorker } from './workers/whatsapp.worker';
 import { startSlaWorker } from './workers/sla.worker';
@@ -15,6 +15,12 @@ const slaWorker = startSlaWorker();
 
 setupSlaRepeatable().catch((error) => {
   console.error('Failed to set up SLA repeatable job:', error);
+});
+setupCertificateReconciliation().catch((error) => {
+  console.error('Failed to set up certificate reconciliation:', error);
+});
+setupDeliveryReconciliation().catch((error) => {
+  console.error('Failed to set up delivery reconciliation:', error);
 });
 
 async function shutdown(signal: string): Promise<void> {

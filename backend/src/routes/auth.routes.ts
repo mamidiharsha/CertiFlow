@@ -50,7 +50,7 @@ router.post('/login', validate(loginSchema), async (req: Request, res: Response)
     // Set httpOnly cookie
     res.cookie('token', token, {
       httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
+      secure: config.cookieSecure,
       sameSite: 'lax',
       maxAge: 24 * 60 * 60 * 1000, // 24 hours
     });
@@ -114,6 +114,11 @@ router.get('/me', authenticate, async (req: Request, res: Response): Promise<voi
 
 // POST /api/auth/switch-user (DEMO ONLY)
 router.post('/switch-user', validate(switchUserSchema), async (req: Request, res: Response): Promise<void> => {
+  if (!config.demoMode) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+
   try {
     const { email } = req.body;
 
@@ -136,7 +141,7 @@ router.post('/switch-user', validate(switchUserSchema), async (req: Request, res
 
     res.cookie('token', token, {
       httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
+      secure: config.cookieSecure,
       sameSite: 'lax',
       maxAge: 24 * 60 * 60 * 1000,
     });

@@ -4,6 +4,7 @@ interface WhatsAppSendRequest {
   phone: string;
   message: string;
   pdfUrl?: string;
+  idempotencyKey: string;
 }
 
 interface WhatsAppSendResponse {
@@ -29,6 +30,7 @@ export async function sendWhatsAppMessage(params: WhatsAppSendRequest): Promise<
         phone: params.phone,
         message: params.message,
         pdfUrl: params.pdfUrl,
+        idempotencyKey: params.idempotencyKey,
       }),
       signal: controller.signal,
     });

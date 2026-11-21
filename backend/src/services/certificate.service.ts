@@ -2,7 +2,9 @@ import path from 'path';
 import fs from 'fs';
 import PDFDocument from 'pdfkit';
 import { PrismaClient, CertificateStatus } from '@prisma/client';
+import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
+import { config } from '../config';
 
 const prisma = new PrismaClient();
 
@@ -125,37 +127,87 @@ export async function createCertificate(params: {
   courseName: string;
   trainingCentre: string;
 }): Promise<{ id: string; certificateNumber: string; pdfPath: string }> {
+  const existing = await prisma.certificate.findUnique({
+    where: { candidateId: params.candidateId },
+  });
+  if (existing) {
+    return ensureCertificatePdf(existing, params);
+  }
+
   const certNumber = await generateCertificateNumber(params.districtCode);
   const issueDate = new Date();
+  const certId = uuidv4();
+
+  try {
+    await prisma.$transaction(async (tx) => {
+      await tx.certificate.create({
+        data: {
+          id: certId,
+          certificateNumber: certNumber,
+          candidateId: params.candidateId,
+          batchId: params.batchId,
+          status: CertificateStatus.ACTIVE,
+          issuedAt: issueDate,
+        },
+      });
+
+      await tx.candidate.update({
+        where: { id: params.candidateId },
+        data: { certificateId: certId },
+      });
+    });
+  } catch (error) {
+    const racedCertificate = await prisma.certificate.findUnique({
+      where: { candidateId: params.candidateId },
+    });
+    if (!racedCertificate) {
+      throw error;
+    }
+    return ensureCertificatePdf(racedCertificate, params);
+  }
+
+  const certificate = await prisma.certificate.findUniqueOrThrow({ where: { id: certId } });
+  return ensureCertificatePdf(certificate, params);
+}
+
+async function ensureCertificatePdf(
+  certificate: { id: string; certificateNumber: string; issuedAt: Date; pdfPath: string | null },
+  params: { candidateName: string; courseName: string; trainingCentre: string }
+): Promise<{ id: string; certificateNumber: string; pdfPath: string }> {
+  if (certificate.pdfPath && fs.existsSync(certificate.pdfPath)) {
+    return {
+      id: certificate.id,
+      certificateNumber: certificate.certificateNumber,
+      pdfPath: certificate.pdfPath,
+    };
+  }
 
   const pdfPath = await generateCertificatePDF({
-    certificateNumber: certNumber,
+    certificateNumber: certificate.certificateNumber,
     candidateName: params.candidateName,
     courseName: params.courseName,
     trainingCentre: params.trainingCentre,
-    issueDate,
+    issueDate: certificate.issuedAt,
   });
 
-  const certId = uuidv4();
-
-  await prisma.$transaction(async (tx) => {
-    await tx.certificate.create({
-      data: {
-        id: certId,
-        certificateNumber: certNumber,
-        candidateId: params.candidateId,
-        batchId: params.batchId,
-        status: CertificateStatus.ACTIVE,
-        issuedAt: issueDate,
-        pdfPath,
-      },
-    });
-
-    await tx.candidate.update({
-      where: { id: params.candidateId },
-      data: { certificateId: certId },
-    });
+  await prisma.certificate.update({
+    where: { id: certificate.id },
+    data: { pdfPath },
   });
 
-  return { id: certId, certificateNumber: certNumber, pdfPath };
+  return {
+    id: certificate.id,
+    certificateNumber: certificate.certificateNumber,
+    pdfPath,
+  };
+}
+
+export function createCertificateDownloadUrl(certificateId: string): string {
+  const token = jwt.sign(
+    { purpose: 'certificate-download', certificateId },
+    config.jwtSecret,
+    { expiresIn: '7d' }
+  );
+  const baseUrl = config.appBaseUrl.replace(/\/+$/, '');
+  return `${baseUrl}/api/certificates/${certificateId}/download?token=${encodeURIComponent(token)}`;
 }

@@ -1,23 +1,16 @@
 import { Queue } from 'bullmq';
-import Redis from 'ioredis';
 import { config } from '../config';
-
-let connection: Redis;
-
-function getConnection(): Redis {
-  if (!connection) {
-    connection = new Redis(config.redisUrl, {
-      maxRetriesPerRequest: null,
-    });
-  }
-  return connection;
-}
 
 export const certificateQueue = new Queue('certificate-generation', {
   connection: { url: config.redisUrl },
   defaultJobOptions: {
     removeOnComplete: 100,
     removeOnFail: 50,
+    attempts: 5,
+    backoff: {
+      type: 'exponential',
+      delay: 5000,
+    },
   },
 });
 
@@ -26,7 +19,7 @@ export const whatsappQueue = new Queue('whatsapp-delivery', {
   defaultJobOptions: {
     removeOnComplete: 100,
     removeOnFail: 50,
-    attempts: 3,
+    attempts: 4,
     backoff: {
       type: 'custom',
     },
@@ -42,9 +35,16 @@ export const slaQueue = new Queue('sla-check', {
 });
 
 export async function addCertificateJob(batchId: string): Promise<void> {
-  await certificateQueue.add('BATCH_APPROVED', { batchId }, {
-    jobId: `cert-${batchId}`,
-  });
+  const jobId = `cert-${batchId}`;
+  const existing = await certificateQueue.getJob(jobId);
+  if (existing) {
+    if (await existing.getState() === 'failed') {
+      await existing.retry('failed');
+    }
+    return;
+  }
+
+  await certificateQueue.add('BATCH_APPROVED', { batchId }, { jobId });
 }
 
 export async function addWhatsAppJob(
@@ -52,22 +52,30 @@ export async function addWhatsAppJob(
   candidatePhone: string,
   candidateName: string,
   certificateNumber: string,
-  pdfPath: string | null,
-  idempotencyKey: string
+  pdfUrl: string,
+  idempotencyKey: string,
+  queueJobId = `wa-${idempotencyKey}-0`
 ): Promise<void> {
-  await whatsappQueue.add('DELIVER_CERTIFICATE', {
+  const data = {
     certificateId,
     candidatePhone,
     candidateName,
     certificateNumber,
-    pdfPath,
+    pdfUrl,
     idempotencyKey,
-  }, {
-    jobId: `wa-${idempotencyKey}`,
-    attempts: 3,
-    backoff: {
-      type: 'custom',
-    },
+  };
+  const existing = await whatsappQueue.getJob(queueJobId);
+  if (existing) {
+    if (await existing.getState() === 'failed') {
+      await existing.retry('failed');
+    }
+    return;
+  }
+
+  await whatsappQueue.add('DELIVER_CERTIFICATE', data, {
+    jobId: queueJobId,
+    attempts: 4,
+    backoff: { type: 'custom' },
   });
 }
 
@@ -83,5 +91,31 @@ export async function setupSlaRepeatable(): Promise<void> {
     repeat: {
       every: 60 * 60 * 1000, // every hour
     },
+  });
+}
+
+export async function setupCertificateReconciliation(): Promise<void> {
+  const repeatables = await certificateQueue.getRepeatableJobs();
+  for (const job of repeatables) {
+    if (job.name === 'RECONCILE_APPROVED_BATCHES') {
+      await certificateQueue.removeRepeatableByKey(job.key);
+    }
+  }
+
+  await certificateQueue.add('RECONCILE_APPROVED_BATCHES', {}, {
+    repeat: { every: 60 * 1000 },
+  });
+}
+
+export async function setupDeliveryReconciliation(): Promise<void> {
+  const repeatables = await whatsappQueue.getRepeatableJobs();
+  for (const job of repeatables) {
+    if (job.name === 'RECONCILE_PENDING_DELIVERIES') {
+      await whatsappQueue.removeRepeatableByKey(job.key);
+    }
+  }
+
+  await whatsappQueue.add('RECONCILE_PENDING_DELIVERIES', {}, {
+    repeat: { every: 60 * 1000 },
   });
 }

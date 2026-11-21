@@ -40,6 +40,9 @@ export const auditMiddleware = async (req: Request, res: Response, next: NextFun
         if (pathParts.length >= 3 && pathParts[2]) {
           entityId = pathParts[2];
         }
+        if (pathParts[1] === 'batches' && pathParts[2] === 'upload' && responseBody?.batch?.id) {
+          entityId = responseBody.batch.id;
+        }
 
         const action = `${req.method} ${req.path}`;
 

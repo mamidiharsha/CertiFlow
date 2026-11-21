@@ -53,9 +53,13 @@ router.get('/stream', authenticate, async (req: Request, res: Response): Promise
 
   subscriber.on('message', (channel: string, message: string) => {
     try {
-      res.write(`data: ${message}\n\n`);
+      const event = JSON.parse(message) as Record<string, unknown>;
+      const eventType = typeof event.type === 'string' && /^[a-zA-Z0-9_-]+$/.test(event.type)
+        ? event.type
+        : 'message';
+      res.write(`event: ${eventType}\ndata: ${JSON.stringify(event)}\n\n`);
     } catch (e) {
-      // Client disconnected
+      console.error(`Failed to forward event from ${channel}:`, e);
     }
   });
 

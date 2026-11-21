@@ -41,6 +41,90 @@ const candidateRowSchema = z.object({
     .or(z.string().transform((s) => parseFloat(s)).pipe(z.number().min(0).max(100))),
 });
 
+type CandidateData = {
+  name: string;
+  phone: string;
+  course: string;
+  score: number;
+};
+
+class BatchRouteError extends Error {
+  constructor(public readonly statusCode: number, message: string) {
+    super(message);
+  }
+}
+
+function assertActionAllowed(
+  user: { role: Role; districtId: string | null },
+  batch: { status: BatchStatus; districtId: string },
+): void {
+  const expectedStatus: Partial<Record<Role, BatchStatus>> = {
+    [Role.DISTRICT_OFFICER]: BatchStatus.PENDING_DISTRICT_REVIEW,
+    [Role.QUALITY_TEAM]: BatchStatus.PENDING_QUALITY_REVIEW,
+    [Role.STATE_OFFICE]: BatchStatus.PENDING_STATE_APPROVAL,
+  };
+
+  if (user.role === Role.DISTRICT_OFFICER && batch.districtId !== user.districtId) {
+    throw new BatchRouteError(403, 'Access denied: different district');
+  }
+  if (expectedStatus[user.role] !== batch.status) {
+    throw new BatchRouteError(409, `Cannot act on a batch in ${batch.status} status`);
+  }
+}
+
+function parseCandidateSpreadsheet(buffer: Buffer): {
+  rows: CandidateData[];
+  totalRows: number;
+  rowErrors: Array<{ row: number; errors: Array<{ field: string; message: string }> }>;
+  error?: string;
+} {
+  let workbook: XLSX.WorkBook;
+  try {
+    workbook = XLSX.read(buffer, { type: 'buffer' });
+  } catch {
+    return { rows: [], totalRows: 0, rowErrors: [], error: 'Unable to read spreadsheet' };
+  }
+  const sheetName = workbook.SheetNames[0];
+  if (!sheetName) {
+    return { rows: [], totalRows: 0, rowErrors: [], error: 'Empty spreadsheet' };
+  }
+
+  const sheet = workbook.Sheets[sheetName];
+  if (!sheet) {
+    return { rows: [], totalRows: 0, rowErrors: [], error: 'Empty sheet' };
+  }
+
+  const sourceRows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet);
+  if (sourceRows.length === 0) {
+    return { rows: [], totalRows: 0, rowErrors: [], error: 'No data rows found in spreadsheet' };
+  }
+
+  const rowErrors: Array<{ row: number; errors: Array<{ field: string; message: string }> }> = [];
+  const rows: CandidateData[] = [];
+
+  for (let index = 0; index < sourceRows.length; index++) {
+    const result = candidateRowSchema.safeParse(sourceRows[index]);
+    if (!result.success) {
+      rowErrors.push({
+        row: index + 2,
+        errors: result.error.errors.map((error) => ({
+          field: error.path.join('.'),
+          message: error.message,
+        })),
+      });
+    } else {
+      rows.push({
+        name: result.data.name.trim(),
+        phone: String(result.data.phone),
+        course: result.data.course.trim(),
+        score: Number(result.data.score),
+      });
+    }
+  }
+
+  return { rows, totalRows: sourceRows.length, rowErrors };
+}
+
 // All routes require auth
 router.use(authenticate);
 
@@ -56,56 +140,18 @@ router.post(
         return;
       }
 
-      const workbook = XLSX.read(req.file.buffer, { type: 'buffer' });
-      const sheetName = workbook.SheetNames[0];
-      if (!sheetName) {
-        res.status(400).json({ error: 'Empty spreadsheet' });
+      const parsed = parseCandidateSpreadsheet(req.file.buffer);
+      if (parsed.error) {
+        res.status(400).json({ error: parsed.error });
         return;
       }
 
-      const sheet = workbook.Sheets[sheetName];
-      if (!sheet) {
-        res.status(400).json({ error: 'Empty sheet' });
-        return;
-      }
-
-      const rows: any[] = XLSX.utils.sheet_to_json(sheet);
-
-      if (rows.length === 0) {
-        res.status(400).json({ error: 'No data rows found in spreadsheet' });
-        return;
-      }
-
-      // Validate every row
-      const errors: Array<{ row: number; errors: Array<{ field: string; message: string }> }> = [];
-      const validatedRows: Array<{ name: string; phone: string; course: string; score: number }> = [];
-
-      for (let i = 0; i < rows.length; i++) {
-        const result = candidateRowSchema.safeParse(rows[i]);
-        if (!result.success) {
-          errors.push({
-            row: i + 2, // +2 for 1-indexed + header row
-            errors: result.error.errors.map((e) => ({
-              field: e.path.join('.'),
-              message: e.message,
-            })),
-          });
-        } else {
-          validatedRows.push({
-            name: result.data.name,
-            phone: String(result.data.phone),
-            course: result.data.course,
-            score: Number(result.data.score),
-          });
-        }
-      }
-
-      if (errors.length > 0) {
+      if (parsed.rowErrors.length > 0) {
         res.status(400).json({
           error: 'Validation failed',
-          totalRows: rows.length,
-          errorCount: errors.length,
-          rowErrors: errors,
+          totalRows: parsed.totalRows,
+          errorCount: parsed.rowErrors.length,
+          rowErrors: parsed.rowErrors,
         });
         return;
       }
@@ -120,13 +166,13 @@ router.post(
             centreId: req.user!.centreId!,
             districtId: req.user!.districtId!,
             title,
-            candidateCount: validatedRows.length,
+            candidateCount: parsed.rows.length,
             status: BatchStatus.DRAFT,
           },
         });
 
         await tx.candidate.createMany({
-          data: validatedRows.map((row) => ({
+          data: parsed.rows.map((row) => ({
             id: uuidv4(),
             batchId: newBatch.id,
             name: row.name,
@@ -256,32 +302,191 @@ router.get('/:id', async (req: Request, res: Response): Promise<void> => {
   }
 });
 
+router.get('/:id/candidates', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const batch = await prisma.batch.findUnique({
+      where: { id: req.params.id },
+      select: { id: true, centreId: true, districtId: true },
+    });
+    if (!batch) {
+      res.status(404).json({ error: 'Batch not found' });
+      return;
+    }
+
+    const user = req.user!;
+    if (
+      (user.role === Role.CENTRE && batch.centreId !== user.centreId) ||
+      (user.role === Role.DISTRICT_OFFICER && batch.districtId !== user.districtId)
+    ) {
+      res.status(403).json({ error: 'Access denied' });
+      return;
+    }
+
+    const candidates = await prisma.candidate.findMany({
+      where: { batchId: batch.id },
+      orderBy: { name: 'asc' },
+    });
+    res.json({ candidates });
+  } catch (error) {
+    console.error('List batch candidates error:', error);
+    res.status(500).json({ error: 'Failed to list batch candidates' });
+  }
+});
+
+router.get('/:id/approvals', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const batch = await prisma.batch.findUnique({
+      where: { id: req.params.id },
+      select: { id: true, centreId: true, districtId: true },
+    });
+    if (!batch) {
+      res.status(404).json({ error: 'Batch not found' });
+      return;
+    }
+
+    const user = req.user!;
+    if (
+      (user.role === Role.CENTRE && batch.centreId !== user.centreId) ||
+      (user.role === Role.DISTRICT_OFFICER && batch.districtId !== user.districtId)
+    ) {
+      res.status(403).json({ error: 'Access denied' });
+      return;
+    }
+
+    const approvals = await prisma.approval.findMany({
+      where: { batchId: batch.id },
+      include: { user: { select: { id: true, name: true, role: true } } },
+      orderBy: { createdAt: 'desc' },
+    });
+    res.json({ approvals });
+  } catch (error) {
+    console.error('List batch approvals error:', error);
+    res.status(500).json({ error: 'Failed to list batch approvals' });
+  }
+});
+
+router.get('/:id/audit-log', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const batch = await prisma.batch.findUnique({
+      where: { id: req.params.id },
+      select: { id: true, centreId: true, districtId: true },
+    });
+    if (!batch) {
+      res.status(404).json({ error: 'Batch not found' });
+      return;
+    }
+
+    const user = req.user!;
+    if (
+      (user.role === Role.CENTRE && batch.centreId !== user.centreId) ||
+      (user.role === Role.DISTRICT_OFFICER && batch.districtId !== user.districtId)
+    ) {
+      res.status(403).json({ error: 'Access denied' });
+      return;
+    }
+
+    const logs = await prisma.auditLog.findMany({
+      where: { entityId: batch.id },
+      include: { user: { select: { id: true, name: true } } },
+      orderBy: { createdAt: 'desc' },
+    });
+    res.json({ logs });
+  } catch (error) {
+    console.error('List batch audit log error:', error);
+    res.status(500).json({ error: 'Failed to list batch audit log' });
+  }
+});
+
+// PUT /api/batches/:id/candidates — replace the spreadsheet for a DRAFT or SENT_BACK batch
+router.put(
+  '/:id/candidates',
+  requireRole(Role.CENTRE),
+  upload.single('file'),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      if (!req.file) {
+        res.status(400).json({ error: 'No file uploaded' });
+        return;
+      }
+
+      const parsed = parseCandidateSpreadsheet(req.file.buffer);
+      if (parsed.error) {
+        res.status(400).json({ error: parsed.error });
+        return;
+      }
+      if (parsed.rowErrors.length > 0) {
+        res.status(400).json({
+          error: 'Validation failed',
+          totalRows: parsed.totalRows,
+          errorCount: parsed.rowErrors.length,
+          rowErrors: parsed.rowErrors,
+        });
+        return;
+      }
+
+      const batchId = req.params.id;
+      const updatedBatch = await prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM batches WHERE id = ${batchId}::uuid FOR UPDATE`;
+        const batch = await tx.batch.findUnique({ where: { id: batchId } });
+
+        if (!batch) {
+          throw new BatchRouteError(404, 'Batch not found');
+        }
+        if (batch.centreId !== req.user!.centreId) {
+          throw new BatchRouteError(403, 'Access denied');
+        }
+        if (batch.status !== BatchStatus.DRAFT && batch.status !== BatchStatus.SENT_BACK) {
+          throw new BatchRouteError(409, 'Candidates can only be updated while the batch is a draft or has been sent back');
+        }
+
+        await tx.candidate.deleteMany({ where: { batchId } });
+        await tx.candidate.createMany({
+          data: parsed.rows.map((row) => ({ id: uuidv4(), batchId, ...row })),
+        });
+
+        return tx.batch.update({
+          where: { id: batchId },
+          data: {
+            candidateCount: parsed.rows.length,
+            version: { increment: 1 },
+            updatedAt: new Date(),
+          },
+          include: { centre: true, district: true },
+        });
+      });
+
+      res.json({ message: 'Batch candidates replaced', batch: updatedBatch });
+    } catch (error) {
+      if (error instanceof BatchRouteError) {
+        res.status(error.statusCode).json({ error: error.message });
+        return;
+      }
+      console.error('Update batch candidates error:', error);
+      res.status(500).json({ error: 'Failed to update batch candidates' });
+    }
+  }
+);
+
 // POST /api/batches/:id/submit — CENTRE only
 router.post(
   '/:id/submit',
   requireRole(Role.CENTRE),
   async (req: Request, res: Response): Promise<void> => {
     try {
-      const batch = await prisma.batch.findUnique({
-        where: { id: req.params.id },
-      });
-
-      if (!batch) {
-        res.status(404).json({ error: 'Batch not found' });
-        return;
-      }
-
-      if (batch.centreId !== req.user!.centreId) {
-        res.status(403).json({ error: 'Access denied' });
-        return;
-      }
-
-      if (batch.status !== BatchStatus.DRAFT && batch.status !== BatchStatus.SENT_BACK) {
-        res.status(400).json({ error: `Cannot submit batch in ${batch.status} status` });
-        return;
-      }
-
+      const batchId = req.params.id;
       const updatedBatch = await prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM batches WHERE id = ${batchId}::uuid FOR UPDATE`;
+        const batch = await tx.batch.findUnique({ where: { id: batchId } });
+        if (!batch) {
+          throw new BatchRouteError(404, 'Batch not found');
+        }
+        if (batch.centreId !== req.user!.centreId) {
+          throw new BatchRouteError(403, 'Access denied');
+        }
+        if (batch.status !== BatchStatus.DRAFT && batch.status !== BatchStatus.SENT_BACK) {
+          throw new BatchRouteError(409, `Cannot submit batch in ${batch.status} status`);
+        }
+
         // If resubmitting from SENT_BACK, supersede all prior approvals
         if (batch.status === BatchStatus.SENT_BACK) {
           await tx.approval.updateMany({
@@ -302,15 +507,19 @@ router.post(
         });
       });
 
-      await publishEvent(`district:${batch.districtId}`, {
+      await publishEvent(`district:${updatedBatch.districtId}`, {
         type: 'batch_status_changed',
-        batchId: batch.id,
+        batchId: updatedBatch.id,
         status: BatchStatus.PENDING_DISTRICT_REVIEW,
-        title: batch.title,
+        title: updatedBatch.title,
       });
 
       res.json({ message: 'Batch submitted for review', batch: updatedBatch });
     } catch (error) {
+      if (error instanceof BatchRouteError) {
+        res.status(error.statusCode).json({ error: error.message });
+        return;
+      }
       console.error('Submit batch error:', error);
       res.status(500).json({ error: 'Failed to submit batch' });
     }
@@ -325,57 +534,32 @@ router.post(
     try {
       const user = req.user!;
       const batchId = req.params.id;
-
-      const batch = await prisma.batch.findUnique({
-        where: { id: batchId },
-        include: { district: true },
-      });
-
-      if (!batch) {
-        res.status(404).json({ error: 'Batch not found' });
+      const request = z.object({ reason: z.string().max(1000).optional() }).safeParse(req.body);
+      if (!request.success) {
+        res.status(400).json({ error: 'Invalid approval details' });
         return;
       }
 
-      // Validate role-status combinations
-      const allowedTransitions: Record<string, BatchStatus[]> = {
-        [Role.DISTRICT_OFFICER]: [BatchStatus.PENDING_DISTRICT_REVIEW],
-        [Role.QUALITY_TEAM]: [BatchStatus.PENDING_QUALITY_REVIEW],
-        [Role.STATE_OFFICE]: [BatchStatus.PENDING_STATE_APPROVAL],
-      };
+      const result = await prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM batches WHERE id = ${batchId}::uuid FOR UPDATE`;
+        const batch = await tx.batch.findUnique({ where: { id: batchId } });
+        if (!batch) {
+          throw new BatchRouteError(404, 'Batch not found');
+        }
+        assertActionAllowed(user, batch);
 
-      if (!allowedTransitions[user.role]?.includes(batch.status)) {
-        res.status(400).json({
-          error: `Cannot approve: batch is in ${batch.status} status, your role is ${user.role}`,
-        });
-        return;
-      }
-
-      // District officer must be from the same district
-      if (user.role === Role.DISTRICT_OFFICER && batch.districtId !== user.districtId) {
-        res.status(403).json({ error: 'Access denied: different district' });
-        return;
-      }
-
-      // Check if this officer already approved (non-superseded)
-      if (user.role === Role.DISTRICT_OFFICER) {
-        const existingApproval = await prisma.approval.findFirst({
+        const existingApproval = await tx.approval.findFirst({
           where: {
             batchId,
             userId: user.id,
+            stage: batch.status,
             superseded: false,
-            action: 'APPROVED',
           },
         });
         if (existingApproval) {
-          res.status(400).json({ error: 'You have already approved this batch' });
-          return;
+          throw new BatchRouteError(409, 'You have already recorded a decision for this review stage');
         }
-      }
 
-      const readVersion = batch.version;
-
-      const result = await prisma.$transaction(async (tx) => {
-        // Create approval record
         await tx.approval.create({
           data: {
             id: uuidv4(),
@@ -383,7 +567,7 @@ router.post(
             userId: user.id,
             stage: batch.status,
             action: 'APPROVED',
-            reason: req.body.reason || null,
+            reason: request.data.reason?.trim() || null,
           },
         });
 
@@ -391,18 +575,16 @@ router.post(
         let shouldGenerateCertificates = false;
 
         if (user.role === Role.DISTRICT_OFFICER) {
-          // Count non-superseded approvals for this batch at district level
           const approvalCount = await tx.approval.count({
             where: {
               batchId,
               superseded: false,
               action: 'APPROVED',
-              stage: BatchStatus.PENDING_DISTRICT_REVIEW,
+              stage: batch.status,
             },
           });
 
           if (approvalCount >= config.districtQuorum) {
-            // Quorum reached — determine next stage
             if (batch.candidateCount >= config.qualityThreshold) {
               newStatus = BatchStatus.PENDING_QUALITY_REVIEW;
             } else {
@@ -416,44 +598,42 @@ router.post(
           shouldGenerateCertificates = true;
         }
 
-        // Optimistic locking: update only if version matches
-        if (newStatus !== batch.status) {
-          const updateResult = await tx.batch.updateMany({
-            where: {
-              id: batchId,
-              version: readVersion,
-            },
-            data: {
-              status: newStatus,
-              version: { increment: 1 },
-              updatedAt: new Date(),
-            },
-          });
+        await tx.batch.update({
+          where: { id: batchId },
+          data: {
+            status: newStatus,
+            version: { increment: 1 },
+            updatedAt: new Date(),
+          },
+        });
 
-          if (updateResult.count === 0) {
-            throw new Error('CONFLICT');
-          }
-        }
-
-        return { newStatus, shouldGenerateCertificates };
+        return {
+          newStatus,
+          previousStatus: batch.status,
+          title: batch.title,
+          centreId: batch.centreId,
+          districtId: batch.districtId,
+          shouldGenerateCertificates,
+        };
       });
 
-      // After transaction: emit events and enqueue jobs
-      if (result.newStatus !== batch.status) {
-        await publishEvent(`batch:${batchId}`, {
+      if (result.newStatus !== result.previousStatus) {
+        const statusEvent = {
           type: 'batch_status_changed',
           batchId,
           status: result.newStatus,
-          title: batch.title,
-        });
+          title: result.title,
+        };
+        await publishEvent(`batch:${batchId}`, statusEvent);
+        await publishEvent(`centre:${result.centreId}`, statusEvent);
+        await publishEvent(`district:${result.districtId}`, statusEvent);
 
-        // Role-specific channels
         if (result.newStatus === BatchStatus.PENDING_QUALITY_REVIEW) {
           await publishEvent('role:QUALITY_TEAM', {
             type: 'batch_status_changed',
             batchId,
             status: result.newStatus,
-            title: batch.title,
+            title: result.title,
           });
         }
         if (result.newStatus === BatchStatus.PENDING_STATE_APPROVAL) {
@@ -461,7 +641,7 @@ router.post(
             type: 'batch_status_changed',
             batchId,
             status: result.newStatus,
-            title: batch.title,
+            title: result.title,
           });
         }
       }
@@ -486,14 +666,12 @@ router.post(
       res.json({
         message: 'Approval recorded',
         batch: updatedBatch,
-        statusChanged: result.newStatus !== batch.status,
+        statusChanged: result.newStatus !== result.previousStatus,
         newStatus: result.newStatus,
       });
-    } catch (error: any) {
-      if (error?.message === 'CONFLICT') {
-        res.status(409).json({
-          error: 'Conflict: batch was modified by another user. Please refresh and try again.',
-        });
+    } catch (error) {
+      if (error instanceof BatchRouteError) {
+        res.status(error.statusCode).json({ error: error.message });
         return;
       }
       console.error('Approve batch error:', error);
@@ -510,28 +688,27 @@ router.post(
     try {
       const user = req.user!;
       const batchId = req.params.id;
-      const { reason } = req.body;
-
-      if (!reason) {
-        res.status(400).json({ error: 'Rejection reason is required' });
+      const request = z.object({ reason: z.string().trim().min(1).max(1000) }).safeParse(req.body);
+      if (!request.success) {
+        res.status(400).json({ error: 'A rejection reason of 1–1000 characters is required' });
         return;
       }
 
-      const batch = await prisma.batch.findUnique({ where: { id: batchId } });
+      const result = await prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM batches WHERE id = ${batchId}::uuid FOR UPDATE`;
+        const batch = await tx.batch.findUnique({ where: { id: batchId } });
+        if (!batch) {
+          throw new BatchRouteError(404, 'Batch not found');
+        }
+        assertActionAllowed(user, batch);
 
-      if (!batch) {
-        res.status(404).json({ error: 'Batch not found' });
-        return;
-      }
+        const priorDecision = await tx.approval.findFirst({
+          where: { batchId, userId: user.id, stage: batch.status, superseded: false },
+        });
+        if (priorDecision) {
+          throw new BatchRouteError(409, 'You have already recorded a decision for this review stage');
+        }
 
-      if (user.role === Role.DISTRICT_OFFICER && batch.districtId !== user.districtId) {
-        res.status(403).json({ error: 'Access denied' });
-        return;
-      }
-
-      const readVersion = batch.version;
-
-      await prisma.$transaction(async (tx) => {
         await tx.approval.create({
           data: {
             id: uuidv4(),
@@ -539,30 +716,35 @@ router.post(
             userId: user.id,
             stage: batch.status,
             action: 'REJECTED',
-            reason,
+            reason: request.data.reason,
           },
         });
 
-        const updateResult = await tx.batch.updateMany({
-          where: { id: batchId, version: readVersion },
+        await tx.batch.update({
+          where: { id: batchId },
           data: {
             status: BatchStatus.REJECTED,
-            rejectionReason: reason,
+            rejectionReason: request.data.reason,
             version: { increment: 1 },
             updatedAt: new Date(),
           },
         });
-
-        if (updateResult.count === 0) {
-          throw new Error('CONFLICT');
-        }
+        return { batch };
       });
 
       await publishEvent(`batch:${batchId}`, {
         type: 'batch_status_changed',
         batchId,
         status: BatchStatus.REJECTED,
-        title: batch.title,
+        title: result.batch.title,
+        reason: request.data.reason,
+      });
+      await publishEvent(`centre:${result.batch.centreId}`, {
+        type: 'batch_status_changed',
+        batchId,
+        status: BatchStatus.REJECTED,
+        title: result.batch.title,
+        reason: request.data.reason,
       });
 
       const updatedBatch = await prisma.batch.findUnique({
@@ -571,9 +753,9 @@ router.post(
       });
 
       res.json({ message: 'Batch rejected', batch: updatedBatch });
-    } catch (error: any) {
-      if (error?.message === 'CONFLICT') {
-        res.status(409).json({ error: 'Conflict: batch was modified. Please refresh.' });
+    } catch (error) {
+      if (error instanceof BatchRouteError) {
+        res.status(error.statusCode).json({ error: error.message });
         return;
       }
       console.error('Reject batch error:', error);
@@ -590,28 +772,27 @@ router.post(
     try {
       const user = req.user!;
       const batchId = req.params.id;
-      const { reason } = req.body;
-
-      if (!reason) {
-        res.status(400).json({ error: 'Reason for sending back is required' });
+      const request = z.object({ reason: z.string().trim().min(1).max(1000) }).safeParse(req.body);
+      if (!request.success) {
+        res.status(400).json({ error: 'A send-back reason of 1–1000 characters is required' });
         return;
       }
 
-      const batch = await prisma.batch.findUnique({ where: { id: batchId } });
+      const result = await prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM batches WHERE id = ${batchId}::uuid FOR UPDATE`;
+        const batch = await tx.batch.findUnique({ where: { id: batchId } });
+        if (!batch) {
+          throw new BatchRouteError(404, 'Batch not found');
+        }
+        assertActionAllowed(user, batch);
 
-      if (!batch) {
-        res.status(404).json({ error: 'Batch not found' });
-        return;
-      }
+        const priorDecision = await tx.approval.findFirst({
+          where: { batchId, userId: user.id, stage: batch.status, superseded: false },
+        });
+        if (priorDecision) {
+          throw new BatchRouteError(409, 'You have already recorded a decision for this review stage');
+        }
 
-      if (user.role === Role.DISTRICT_OFFICER && batch.districtId !== user.districtId) {
-        res.status(403).json({ error: 'Access denied' });
-        return;
-      }
-
-      const readVersion = batch.version;
-
-      await prisma.$transaction(async (tx) => {
         await tx.approval.create({
           data: {
             id: uuidv4(),
@@ -619,39 +800,37 @@ router.post(
             userId: user.id,
             stage: batch.status,
             action: 'SENT_BACK',
-            reason,
+            reason: request.data.reason,
           },
         });
 
-        const updateResult = await tx.batch.updateMany({
-          where: { id: batchId, version: readVersion },
+        await tx.batch.update({
+          where: { id: batchId },
           data: {
             status: BatchStatus.SENT_BACK,
-            rejectionReason: reason,
+            rejectionReason: request.data.reason,
             version: { increment: 1 },
             updatedAt: new Date(),
           },
         });
-
-        if (updateResult.count === 0) {
-          throw new Error('CONFLICT');
-        }
+        return { batch };
       });
 
       await publishEvent(`batch:${batchId}`, {
         type: 'batch_status_changed',
         batchId,
         status: BatchStatus.SENT_BACK,
-        title: batch.title,
+        title: result.batch.title,
+        reason: request.data.reason,
       });
 
       // Notify the centre
-      await publishEvent(`centre:${batch.centreId}`, {
+      await publishEvent(`centre:${result.batch.centreId}`, {
         type: 'batch_status_changed',
         batchId,
         status: BatchStatus.SENT_BACK,
-        title: batch.title,
-        reason,
+        title: result.batch.title,
+        reason: request.data.reason,
       });
 
       const updatedBatch = await prisma.batch.findUnique({
@@ -660,9 +839,9 @@ router.post(
       });
 
       res.json({ message: 'Batch sent back', batch: updatedBatch });
-    } catch (error: any) {
-      if (error?.message === 'CONFLICT') {
-        res.status(409).json({ error: 'Conflict: batch was modified. Please refresh.' });
+    } catch (error) {
+      if (error instanceof BatchRouteError) {
+        res.status(error.statusCode).json({ error: error.message });
         return;
       }
       console.error('Send back error:', error);

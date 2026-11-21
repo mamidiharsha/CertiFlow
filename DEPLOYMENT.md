@@ -1,303 +1,164 @@
-# CertiFlow — Production Deployment Plan
+# CertiFlow Production Deployment Plan
 
-> Scale targets: **100,000 registered users**, **~10,000 DAU**, peak of **500 batches/hour** generating **30,000 PDFs + 30,000 WhatsApp messages**, and **thousands of public verifications per day** in bursts.
+> **Status:** This document proposes a production architecture; it is not deployed infrastructure or a load-test result. The current Docker Compose setup is for local development and demos.
 
----
+## Workload assumptions
 
-## 1. Architecture Diagram
+- 100,000 registered users and approximately 10,000 daily active users.
+- Up to 500 approved batches in an hour on results day.
+- At 60 candidates per batch, that is about 30,000 certificates and 30,000 WhatsApp messages in an hour, or an average of 8.3 of each per second during that hour.
+- Thousands of public verification requests per day, with short bursts.
 
-```
-                            ┌───────────────────────────────────────────┐
-                            │            CloudFront CDN                 │
-                            │   (static frontend, /verify page)         │
-                            └────────────────┬──────────────────────────┘
-                                             │
-                         ┌───────────────────▼───────────────────────┐
-                         │          Application Load Balancer         │
-                         │   (TLS termination, path-based routing)   │
-                         └────┬──────────────┬──────────────┬────────┘
-                              │              │              │
-                    ┌─────────▼──┐  ┌────────▼───┐  ┌──────▼───────┐
-                    │  API Srv 1 │  │  API Srv 2 │  │  API Srv 3   │
-                    │  (Fargate) │  │  (Fargate) │  │  (Fargate)   │
-                    └─────┬──────┘  └─────┬──────┘  └──────┬───────┘
-                          │               │                │
-              ┌───────────▼───────────────▼────────────────▼──────┐
-              │                     Redis Cluster                  │
-              │  ElastiCache (2-node) — sessions, pub/sub, cache  │
-              └──────────┬──────────────────────────┬─────────────┘
-                         │                          │
-              ┌──────────▼──────────┐    ┌──────────▼──────────────┐
-              │   BullMQ Queues     │    │   SSE pub/sub channels  │
-              │  cert-gen │ whatsapp│    │   (real-time events)    │
-              └─────┬─────┴────┬────┘    └─────────────────────────┘
-                    │          │
-        ┌───────────▼──┐  ┌───▼──────────────┐
-        │ Cert Workers │  │ WhatsApp Workers  │
-        │ 1→50 Fargate │  │ 1→20 Fargate     │
-        │ (auto-scale) │  │ (auto-scale)     │
-        └───────┬──────┘  └───┬──────────────┘
-                │             │
-        ┌───────▼──────┐  ┌──▼──────────────┐
-        │  S3 Bucket   │  │  WhatsApp API   │
-        │ (PDF certs)  │  │  (external)     │
-        └──────────────┘  └─────────────────┘
-              │
-    ┌─────────▼──────────────────────────────────────────┐
-    │            PostgreSQL (RDS Multi-AZ)                │
-    │  Primary (writes) ──────► Read Replica (reads)     │
-    │  db.r6g.large              (verification queries)  │
-    └────────────────────────────────────────────────────┘
+The average rate is not a capacity guarantee. Worker throughput, database capacity, provider limits, retries, and burst shape need to be measured with representative load tests before launch.
+
+## Proposed architecture and event flow
+
+```text
+ Candidates / staff / public
+             |
+       Route 53 + WAF
+        /           \
+ CloudFront         ALB (TLS)
+ (web assets)          |
+                   ECS Fargate
+              API tasks (horizontal)
+                |             |
+                |             +--> Redis / BullMQ
+                |                    |          |
+                |                PDF jobs   WhatsApp jobs
+                |                    |          |
+                |               PDF workers  Delivery workers
+                |                    |          |
+                |                    v          v
+                |                 Private S3   WhatsApp provider
+                |
+        RDS PostgreSQL (Multi-AZ)
+          writer + optional read replica
+                |
+        audit and workflow data
+
+ API / workers --> structured logs, metrics, traces, and alerts
+ API --> Redis Pub/Sub --> SSE clients (best-effort live updates)
 ```
 
----
+1. The API validates the request, checks the actor's role and scope, and writes the workflow change and audit record to PostgreSQL in a transaction.
+2. After a successful state change, background work is queued for certificate generation or message delivery. Workers update delivery state in PostgreSQL and can publish live UI notifications.
+3. Public verification reads the current certificate status from the database. Keep revocation checks on the primary, or use another design with a proven freshness guarantee, so a recently cancelled certificate is not shown as valid due to replica lag or stale cache.
+4. For stronger production delivery guarantees, add a transactional outbox: write the event to an outbox table in the same transaction as the business change, then publish it to the queue and mark it delivered. The local demo uses queue reconciliation, not a transactional outbox.
 
-## 2. Component Hosting (AWS)
+## Where components run and why
 
-| Component          | Service                | Spec                                                        | Why                                              |
-| ------------------ | ---------------------- | ----------------------------------------------------------- | ------------------------------------------------ |
-| **Frontend**       | CloudFront + S3        | Static build artifacts                                      | Global edge caching, zero server maintenance     |
-| **API Servers**    | ECS Fargate            | 3 instances min, auto-scale on CPU > 60% / 500 req/s        | Stateless; Fargate = zero AMI/patching overhead  |
-| **Cert Workers**   | ECS Fargate            | 1 baseline, scale 1→50 on queue depth                       | Separate task def isolates CPU-heavy PDF gen     |
-| **WhatsApp Workers** | ECS Fargate          | 1 baseline, scale 1→20 on queue depth                       | I/O-bound; separate scaling profile              |
-| **PostgreSQL**     | RDS PostgreSQL 16      | db.r6g.large, Multi-AZ, 100 GB gp3, 1 read replica         | Managed backups, failover, read scaling          |
-| **Redis**          | ElastiCache Redis 7    | cache.r6g.large, 2-node cluster (primary + replica)         | BullMQ persistence, pub/sub, verification cache  |
-| **File Storage**   | S3 Standard            | Presigned URLs for PDF access (1-hour expiry)               | Unlimited storage, IAM-controlled access         |
-| **Load Balancer**  | Application LB         | TLS termination, path-based routing, WebSocket/SSE support  | Health checks, sticky sessions not needed        |
-| **DNS**            | Route 53               | A-alias to CloudFront + ALB                                 | Low-latency DNS, health-check routing            |
+| Component | Proposed hosting | Reason |
+| --- | --- | --- |
+| Frontend | Static assets in private S3 behind CloudFront | Low operational overhead and edge delivery for the web app. |
+| DNS and edge protection | Route 53, CloudFront, and AWS WAF | Managed DNS, TLS entry points, and filtering/rate limits for public traffic. |
+| API | ECS Fargate tasks behind an Application Load Balancer | Stateless API tasks can scale horizontally without managing servers. |
+| Certificate and delivery workers | Separate ECS Fargate task services | PDF CPU load and provider network latency can scale independently from interactive API traffic. |
+| Primary database | RDS PostgreSQL Multi-AZ | Managed backups and failover for authoritative workflow and audit data. |
+| Read replica | RDS PostgreSQL read replica, if measurements justify it | Offload suitable read-heavy views; do not use for revocation-sensitive verification unless its staleness is safely handled. |
+| Queue and live notifications | Managed Redis configured for BullMQ persistence and failover | Queue coordination and best-effort Pub/Sub without relying on process-local state. |
+| Certificate files | Private S3 bucket with encryption and blocked public access | Durable storage separated from worker and API instances. |
+| Secrets | AWS Secrets Manager or Parameter Store with KMS | Central rotation and access control for credentials and signing keys. |
 
----
+Place the database, Redis, and worker tasks in private subnets. Only the load balancer and required edge services should accept public traffic. Use separate IAM roles for API, workers, and deployment tasks.
 
-## 3. Scaling Strategy
+## Scaling and peak throughput
 
-### API Servers
+### API
 
-- **Horizontal**, stateless — no session affinity needed (JWT auth, Redis for state).
-- Auto-scale on **CPU > 60%** or **request count > 500/target**.
-- Min 3, max 10 instances.
-- Each instance: 1 vCPU, 2 GB RAM.
+- Run at least two API tasks across availability zones and scale on CPU, memory, request rate, and latency.
+- Keep authentication and workflow state in shared services, not process memory, so any API task can handle the next request.
+- Use connection pooling and explicit database connection budgets across API and worker task counts.
 
-### Certificate Generation Workers
+### Certificate workers
 
-- **Bottleneck**: PDF generation ~500ms per certificate using PDFKit.
-- Peak demand: 30,000 PDFs in a 1-hour window → need ~500 concurrent workers.
-- Auto-scale on **queue depth** (target: < 1,000 pending jobs).
-- Scale range: **1 → 50 Fargate tasks**, each running 10 concurrent BullMQ workers.
-- Queue backlog clearance: 50 tasks × 10 workers × 2 PDFs/s = **1,000 PDFs/s** → 30K in ~30 seconds.
+- Scale the certificate worker service using queue age and queue depth, not CPU alone.
+- The target hour averages 8.3 PDF jobs per second. Benchmark PDF generation, database reads/writes, and S3 uploads together to calculate workers required with retry and failure headroom.
+- Keep work idempotent: a retry should reuse or repair the certificate for a candidate, not issue a second certificate.
+- The main likely limits are measured PDF throughput, database connections and write capacity, and storage/network throughput. Increase worker concurrency only while database latency and error rates remain healthy.
 
-### WhatsApp Delivery Workers
+### WhatsApp workers
 
-- I/O-bound (HTTP calls to WhatsApp API, ~200ms each).
-- Auto-scale on **queue depth** separately from cert workers.
-- Scale range: **1 → 20 Fargate tasks**.
-- BullMQ rate limiter: max 100 messages/second (WhatsApp API rate limit).
+- Scale delivery workers separately, based on queue age/depth and provider response latency.
+- Set a rate limiter below the provider's contracted quota and leave capacity for retries. Confirm the provider's burst and sustained limits before launch.
+- Use provider idempotency keys or a delivery-status reconciliation API. A timeout can happen after the provider accepted a message; without provider support, retrying cannot guarantee exactly-once delivery.
 
-### Verification Endpoint
+### Clearing a backlog
 
-- **Redis cache** (TTL 5 min for ACTIVE, no cache for CANCELLED) absorbs burst reads.
-- **Read replica** handles cache-miss queries — no load on primary.
-- Expected: 95%+ cache hit rate during bursts (certificate numbers are shared/linked).
+Measure job arrival rate and processing rate. During a backlog, temporarily add worker capacity within database and provider limits; keep the API responsive by reserving database connections for it. Alert on oldest-job age and estimated drain time. If incoming work exceeds processing capacity for an extended period, communicate delivery delays rather than increasing concurrency without bounds.
 
-### Database
+Run load tests for the expected 8.3 jobs/second average and a higher burst profile. Include realistic PDF size, provider latency, transient errors, database contention, and worker restarts. Record achieved throughput and time to drain a known backlog before choosing production autoscaling limits.
 
-- **Write path**: Primary only. PgBouncer connection pooling (pool_mode=transaction, max 100 connections).
-- **Read path**: Verification queries → read replica. Dashboard aggregations → read replica.
-- **Indexing**: certificate_number (unique), batch status, delivery idempotency_key.
+## Failure handling
 
----
+| Failure | Detection | Planned response |
+| --- | --- | --- |
+| Worker crashes or is replaced | BullMQ stalled jobs, worker health checks, and queue-age alerts | Retry idempotent jobs with bounded backoff. Reconcile approved batches and pending deliveries from PostgreSQL so work can be re-enqueued after a lost queue write. Escalate jobs that exhaust attempts. |
+| Redis restart or failover | Redis health metrics, connection errors, and queue-age growth | Use managed failover and persistence settings appropriate for BullMQ. Workers reconnect; database records remain authoritative. Reconciliation restores eligible work. Test the actual Redis failover mode before relying on it. |
+| WhatsApp outage or ambiguous timeout | Provider errors, timeout rate, and oldest delivery age | Retry with bounded exponential backoff and jitter; observe provider quotas. Use an idempotency/reconciliation contract. Expose terminal failures for an authorized manual retry and alert on sustained delivery delays. |
+| Slow or unavailable PostgreSQL | Connection-pool saturation, query latency, CPU, locks, and health checks | Pool connections, tune slow queries and indexes, and scale the database based on measurements. Reduce worker concurrency to protect interactive traffic. Use Multi-AZ failover and retry transient errors safely. |
+| S3 error or missing PDF | Upload/download errors and object checks | Retry uploads; regenerate a PDF from persisted certificate data when possible. Keep the bucket private and record download activity. |
+| Batch remains untouched past its SLA | Scheduled query for pending batches and oldest pending age | Notify the assigned district/state team and escalate to a senior operational queue. The local app has a configurable SLA concept; production notifications and escalation need to be implemented and operated. |
+| API task failure | ALB health checks and 5xx/latency alarms | Remove unhealthy tasks from rotation and let ECS replace them. Keep database transactions short and safe to retry. |
 
-## 4. Failure Handling
+Use exponential backoff with jitter and a maximum attempt count. Preserve the final error and retry history for support staff; do not silently discard exhausted work.
 
-| Failure                     | Detection                     | Response                                                                                     |
-| --------------------------- | ----------------------------- | -------------------------------------------------------------------------------------------- |
-| **Worker crash**            | BullMQ stalled job detection  | Auto-retry with exponential backoff (1m, 5m, 30m). Job visibility timeout = 60s.             |
-| **Redis restart**           | ElastiCache failover          | BullMQ queues are durable (Redis AOF persistence). SSE clients auto-reconnect in 5s.         |
-| **PostgreSQL failover**     | RDS Multi-AZ automatic        | 60–120s failover. Connection pool retries. Write operations fail fast with retry hint.        |
-| **WhatsApp API outage**     | HTTP 5xx / timeout            | Exponential backoff (1m, 5m, 30m). Dead letter queue after 3 failures. Manual retry dashboard. |
-| **S3 unavailable**          | HTTP error on presigned URL   | PDFs are regenerable from DB data. Queue a re-generation job on access failure.               |
-| **ALB health check fail**   | /health endpoint              | Unhealthy instance removed from target group. ECS replaces it.                                |
-| **Slow DB queries**         | P95 latency > 500ms alert     | PgBouncer limits concurrency. Read replica absorbs read load. Query plan analysis.            |
+## Certificate storage and access control
 
-### Dead Letter Queue (DLQ) Strategy
+- Store generated PDFs in a private S3 bucket with public access blocked, encryption at rest, and TLS-only access.
+- Give workers permission to write only to the certificate object prefix they need. The API should not expose general bucket credentials or public object URLs.
+- Authorize a download using the signed-in candidate or an appropriately scoped certificate token, check that the certificate is still active, and issue a short-lived download link or proxy the file. A presigned URL remains usable until it expires, so use a short lifetime and account for that revocation window.
+- Keep certificate numbers unique in PostgreSQL. Log issuance, cancellation, verification outcomes as appropriate, and downloads without logging bearer tokens or unnecessary personal information.
+- Retain certificates and audit records according to the programme's legal retention policy; protect backups and test restoration.
 
-```
-WhatsApp Queue ──3 failures──► DLQ
-                                │
-                                ▼
-                   Admin Dashboard: manual retry
-                   Alerting: PagerDuty notification
-```
+## Monitoring, logs, and alerts
 
-- DLQ jobs retain full context (certificate ID, phone, message).
-- Admin dashboard allows bulk retry or individual re-dispatch.
-- DLQ depth > 100 triggers PagerDuty alert.
+Use CloudWatch or an equivalent managed monitoring platform. Add dashboards for:
 
----
+- API request volume, latency (p50/p95/p99), 4xx/5xx rates, and health.
+- PostgreSQL CPU, storage, connections, lock waits, slow queries, and failovers.
+- Redis availability, memory, connections, evictions, and failovers.
+- Queue depth, oldest job age, retry count, completed/failed jobs, and estimated drain time for each worker type.
+- PDF generation time and error rate; WhatsApp provider latency, timeout, failure, and delivery rate.
+- Batch age by approval stage and SLA breaches.
+- Public verification latency and error rate.
 
-## 5. Certificate Storage
+Send structured logs to a central service with request/job correlation IDs. Do not log full candidate data, passwords, authentication tokens, signed download URLs, or message bodies unless there is a documented operational need and appropriate controls.
 
-| Aspect               | Implementation                                                     |
-| --------------------- | ------------------------------------------------------------------ |
-| **Storage**           | S3 Standard, server-side encryption (AES-256)                      |
-| **Access**            | Presigned URLs with 1-hour expiry, generated on-demand              |
-| **Public access**     | Disabled. All access via presigned URLs only.                       |
-| **Bucket policy**     | Deny all public access. IAM role for backend/workers only.          |
-| **Audit**             | S3 access logging enabled. Download events logged to AuditLog table. |
-| **Lifecycle**         | No automatic deletion. Archive to S3 Glacier after 2 years.         |
-| **Re-generation**     | PDFs can be regenerated from DB data if S3 object is lost.          |
+Initial alert examples (tune after load testing):
 
-### Presigned URL Flow
+- Any API/worker service unavailable or sustained API 5xx rate above 5%.
+- Oldest certificate or delivery job exceeds the agreed service target, or queue depth grows continuously.
+- WhatsApp failure/timeout rate exceeds the provider baseline.
+- Database connection pool is near exhaustion, or p95 query latency exceeds the agreed threshold.
+- Any batch exceeds the 48-hour review SLA.
+- Certificate cancellation/verification errors or unusual verification traffic indicate a security or availability issue.
 
-```
-Client ──GET /api/certificates/:id/download──► API Server
-                                                   │
-                                     Generate presigned URL (1h TTL)
-                                                   │
-                                     302 Redirect ─► S3 (direct download)
-```
+The current local demo does not include CloudWatch dashboards, alerting, tracing, or production on-call integration.
 
----
+## Indicative monthly cost
 
-## 6. Monitoring & Alerting
+Very rough AWS estimate in USD for one region and the architecture above:
 
-### Metrics (Prometheus + Grafana)
+| Area | Approximate monthly range |
+| --- | ---: |
+| API and worker compute | $400–$1,200 |
+| Multi-AZ PostgreSQL and optional read replica | $500–$1,500 |
+| Managed Redis | $100–$400 |
+| S3, CloudFront, load balancer, and data transfer | $100–$500 |
+| Logs, metrics, backups, and security services | $150–$600 |
+| **Indicative total** | **about $1,250–$4,200/month** |
 
-| Metric                        | Source          | Dashboard Panel          |
-| ----------------------------- | --------------- | ------------------------ |
-| Request latency (P50/P95/P99) | API servers     | API Performance          |
-| Request error rate             | API servers     | API Health               |
-| Queue depth (cert/whatsapp)    | Redis/BullMQ    | Queue Monitor            |
-| Jobs processed/min             | Workers         | Worker Throughput        |
-| Delivery success rate          | WhatsApp worker | Delivery Dashboard       |
-| DB connection pool usage       | PgBouncer       | Database Health          |
-| Cache hit rate                 | Redis           | Verification Performance |
-| Active SSE connections         | API servers     | Real-time Status         |
+This is an order-of-magnitude planning estimate, not a quote. It excludes WhatsApp provider fees, taxes, support plans, unusual egress, and sustained peak worker scaling. Actual price depends on AWS region, retention, traffic, database sizing, and reserved capacity. Validate with the AWS Pricing Calculator after load tests and a region decision.
 
-### Logging
+The main trade-offs are:
 
-- **Format**: Structured JSON (timestamp, level, service, requestId, userId, message, metadata).
-- **Destination**: CloudWatch Logs → CloudWatch Insights for querying.
-- **Retention**: 30 days hot, 1 year archived.
-- **Correlation**: Every request gets a unique `requestId` header, propagated through queues.
+- **Fargate vs. EC2:** Fargate reduces server operations but can cost more at steady high utilization.
+- **Multi-AZ database and Redis:** Higher availability costs more than a single-node demo, but reduces dependence on one host or availability zone.
+- **Read replica:** Adds cost and operational complexity; use only when query load justifies it and verification freshness remains correct.
+- **Worker headroom:** Scaling workers reduces delivery backlog, but is constrained by database capacity, provider quotas, and cost.
+- **CloudFront and private S3:** Improve asset delivery and protect certificates, but add egress and request charges.
 
-### Alerts (PagerDuty)
+## Production readiness work
 
-| Alert                           | Threshold        | Severity  | Action                               |
-| ------------------------------- | ---------------- | --------- | ------------------------------------ |
-| Queue depth > 10,000            | 5 min sustained  | P2        | Scale workers, investigate backlog   |
-| API error rate > 5%             | 5 min window     | P1        | Investigate, check dependencies      |
-| Delivery failure rate > 10%     | 15 min window    | P2        | Check WhatsApp API, review DLQ       |
-| DLQ depth > 100                 | Any              | P2        | Manual triage required               |
-| DB CPU > 80%                    | 10 min sustained | P2        | Scale read replica, check queries    |
-| DB connection pool exhausted    | Any              | P1        | Increase pool, check connection leaks|
-| Health check failures           | 3 consecutive    | P1        | Auto-replaced by ECS, investigate    |
-| Batch stuck (SLA breached)      | Hourly check     | P3        | Notify approvers, escalate           |
-
-### Health Checks
-
-Every service exposes `GET /health`:
-
-```json
-{
-  "status": "healthy",
-  "version": "1.0.0",
-  "uptime": 86400,
-  "checks": {
-    "database": "connected",
-    "redis": "connected",
-    "queues": "active"
-  }
-}
-```
-
----
-
-## 7. Cost Estimate
-
-| Component                | Service                 | Monthly Cost | Notes                                |
-| ------------------------ | ----------------------- | ------------ | ------------------------------------ |
-| **API Servers**          | ECS Fargate (3 tasks)   | $150         | 1 vCPU, 2 GB each                   |
-| **Cert Workers**         | ECS Fargate (1–50)      | $150         | Average 5 tasks; spikes at peak     |
-| **WhatsApp Workers**     | ECS Fargate (1–20)      | $100         | Average 3 tasks                     |
-| **PostgreSQL**           | RDS db.r6g.large Multi-AZ | $200       | Includes read replica               |
-| **Redis**                | ElastiCache cache.r6g.large | $100     | 2-node cluster                      |
-| **S3 Storage**           | S3 Standard             | $20          | ~10 GB (100K certs × 100 KB)        |
-| **CloudFront**           | CDN                     | $30          | Static frontend, low transfer       |
-| **ALB**                  | Application LB          | $20          | Fixed cost + LCU                    |
-| **Data Transfer**        | AWS                     | $20          | Internal mostly free                |
-| **Monitoring**           | CloudWatch + Grafana    | $30          | Logs, metrics, dashboards           |
-| **Total (steady state)** |                         | **~$820/mo** |                                      |
-| **Total (sustained peak)** |                       | **~$1,500/mo** | Workers scaled to max              |
-
-### Trade-offs
-
-- **Fargate vs EC2**: Fargate costs ~30% more but eliminates all patching, AMI management, and capacity planning. For a team of this size, ops savings outweigh cost.
-- **RDS vs self-managed PostgreSQL**: RDS costs more but provides automated backups, failover, and patching.
-- **ElastiCache vs self-managed Redis**: Same reasoning — operational simplicity wins for a small team.
-
-### Cost Optimisation Path
-
-1. **Reserved Instances**: Commit to 1-year RI for RDS and ElastiCache → ~40% savings (~$120/mo saved).
-2. **Fargate Spot**: Use Spot for workers (interruptible, jobs are idempotent) → ~70% savings on worker compute.
-3. **S3 Intelligent-Tiering**: Auto-archive old certificates → negligible storage costs.
-4. **With optimisations**: Total drops to **~$550/mo** steady state.
-
----
-
-## 8. Security Considerations
-
-| Aspect                  | Implementation                                                              |
-| ----------------------- | --------------------------------------------------------------------------- |
-| **TLS**                 | Enforced at ALB (ACM certificate). HTTP → HTTPS redirect.                   |
-| **Authentication**      | JWT with httpOnly cookies. Token expiry: 24h. No refresh tokens (hackathon). |
-| **Authorization**       | RBAC middleware on every route. Role checks in business logic.               |
-| **Secrets**             | AWS Secrets Manager for JWT_SECRET, DB credentials. Not in env vars.         |
-| **Network**             | VPC with private subnets for DB/Redis. API servers in public subnet.         |
-| **Input Validation**    | Zod schemas on every endpoint. Parameterised queries via Prisma (no SQL injection). |
-| **Rate Limiting**       | ALB-level rate limiting. Per-IP throttle on /verify (1000 req/min).          |
-| **Audit Trail**         | Every mutation logged with userId, action, IP, timestamp. Immutable.         |
-
----
-
-## 9. Deployment Pipeline
-
-```
-  Developer Push
-       │
-       ▼
-  GitHub Actions CI
-  ├─ Lint + Type Check
-  ├─ Unit Tests (Vitest)
-  ├─ Build Docker Images
-  └─ Push to ECR
-       │
-       ▼
-  Staging Deploy (auto)
-  ├─ Run Prisma Migrations
-  ├─ Smoke Tests
-  └─ Manual QA Gate
-       │
-       ▼
-  Production Deploy (manual approval)
-  ├─ Blue/Green via ECS
-  ├─ Prisma Migrate Deploy
-  ├─ Health Check Validation
-  └─ Rollback on failure
-```
-
-### Database Migrations
-
-- Prisma migrations are **forward-only** in production.
-- Run `npx prisma migrate deploy` as a pre-deploy step (ECS task).
-- Breaking schema changes require a two-phase approach: add new columns first, deploy code, then remove old columns.
-
----
-
-## 10. Disaster Recovery
-
-| Scenario              | RTO       | RPO       | Strategy                                                |
-| --------------------- | --------- | --------- | ------------------------------------------------------- |
-| **Single AZ outage**  | < 2 min   | 0         | Multi-AZ RDS failover, ECS re-places tasks              |
-| **Region outage**     | < 1 hour  | < 5 min   | Cross-region RDS replica, S3 cross-region replication    |
-| **Data corruption**   | < 30 min  | < 1 hour  | RDS point-in-time recovery (5-min granularity)           |
-| **Full rebuild**      | < 2 hours | < 1 hour  | Infrastructure as Code (Terraform), automated seeding    |
+Before production, complete threat modeling and role/permission review; add rate limiting and operational monitoring; load-test the peak and failure scenarios; verify database and Redis recovery; define backup retention and restoration procedures; and implement the chosen provider's idempotency/reconciliation integration. The infrastructure and cost plan above should be revised using those results.

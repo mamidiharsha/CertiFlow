@@ -184,6 +184,7 @@ model DeliveryAttempt {
   candidatePhone  String         @map("candidate_phone")
   status          DeliveryStatus @default(PENDING)
   attempts        Int            @default(0)
+  dispatchGeneration Int          @default(0) @map("dispatch_generation")
   lastAttemptAt   DateTime?      @map("last_attempt_at")
   idempotencyKey  String         @unique @map("idempotency_key")
   error           String?

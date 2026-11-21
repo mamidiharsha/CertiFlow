@@ -1,8 +1,8 @@
 import { Worker, Job } from 'bullmq';
 import { PrismaClient, BatchStatus } from '@prisma/client';
 import { config } from '../config';
-import { createCertificate } from '../services/certificate.service';
-import { addWhatsAppJob } from '../queues';
+import { createCertificate, createCertificateDownloadUrl } from '../services/certificate.service';
+import { addCertificateJob, addWhatsAppJob } from '../queues';
 import { publishEvent } from '../events';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -12,6 +12,17 @@ export function startCertificateWorker(): Worker {
   const worker = new Worker(
     'certificate-generation',
     async (job: Job) => {
+      if (job.name === 'RECONCILE_APPROVED_BATCHES') {
+        const approvedBatches = await prisma.batch.findMany({
+          where: { status: BatchStatus.APPROVED },
+          select: { id: true },
+        });
+        for (const batch of approvedBatches) {
+          await addCertificateJob(batch.id);
+        }
+        return;
+      }
+
       const { batchId } = job.data;
 
       console.log(`[CertWorker] Processing BATCH_APPROVED for batch ${batchId}`);
@@ -37,12 +48,6 @@ export function startCertificateWorker(): Worker {
       let generatedCount = 0;
 
       for (const candidate of batch.candidates) {
-        // Skip if certificate already exists for this candidate
-        if (candidate.certificateId) {
-          console.log(`[CertWorker] Candidate ${candidate.id} already has certificate. Skipping.`);
-          continue;
-        }
-
         try {
           const cert = await createCertificate({
             candidateId: candidate.id,
@@ -58,14 +63,16 @@ export function startCertificateWorker(): Worker {
           // Create a delivery attempt record and enqueue WhatsApp job
           const idempotencyKey = `wa-${cert.id}-${candidate.phone}`;
 
-          await prisma.deliveryAttempt.create({
-            data: {
+          const delivery = await prisma.deliveryAttempt.upsert({
+            where: { idempotencyKey },
+            create: {
               id: uuidv4(),
               certificateId: cert.id,
               candidatePhone: candidate.phone,
               status: 'PENDING',
               idempotencyKey,
             },
+            update: {},
           });
 
           await addWhatsAppJob(
@@ -73,12 +80,19 @@ export function startCertificateWorker(): Worker {
             candidate.phone,
             candidate.name,
             cert.certificateNumber,
-            cert.pdfPath,
-            idempotencyKey
+            createCertificateDownloadUrl(cert.id),
+            idempotencyKey,
+            `wa-${idempotencyKey}-${delivery.dispatchGeneration}`
           );
 
           // Publish event per certificate
           await publishEvent(`batch:${batchId}`, {
+            type: 'certificate_issued',
+            certificateId: cert.id,
+            certificateNumber: cert.certificateNumber,
+            candidateName: candidate.name,
+          });
+          await publishEvent(`centre:${batch.centreId}`, {
             type: 'certificate_issued',
             certificateId: cert.id,
             certificateNumber: cert.certificateNumber,
@@ -100,6 +114,20 @@ export function startCertificateWorker(): Worker {
       });
 
       await publishEvent(`batch:${batchId}`, {
+        type: 'batch_status_changed',
+        batchId,
+        status: BatchStatus.CERTIFICATES_ISSUED,
+        title: batch.title,
+        certificatesGenerated: generatedCount,
+      });
+      await publishEvent(`district:${batch.districtId}`, {
+        type: 'batch_status_changed',
+        batchId,
+        status: BatchStatus.CERTIFICATES_ISSUED,
+        title: batch.title,
+        certificatesGenerated: generatedCount,
+      });
+      await publishEvent('role:STATE_OFFICE', {
         type: 'batch_status_changed',
         batchId,
         status: BatchStatus.CERTIFICATES_ISSUED,

@@ -21,6 +21,9 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -40,10 +43,17 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+    volumes:
+      - certificate_files:/app/generated/certificates
     environment:
       DATABASE_URL: postgresql://certiflow:certiflow123@postgres:5432/certiflow
       REDIS_URL: redis://redis:6379
       JWT_SECRET: certiflow-hackathon-secret-key-2026
+      DEMO_MODE: "true"
+      COOKIE_SECURE: "false"
+      APP_BASE_URL: http://localhost
       WHATSAPP_API_URL: http://whatsapp-mock:3001/api/send
       NODE_ENV: production
 
@@ -55,6 +65,11 @@ services:
     restart: unless-stopped
     ports:
       - "3001:3001"
+    environment:
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
 
   # ── Frontend (Nginx) ───────────────────────────────────────────
   frontend:
@@ -82,3 +97,5 @@ services:
 
 volumes:
   pgdata:
+  redisdata:
+  certificate_files:
