@@ -8,7 +8,7 @@ The workflow records decisions and supports corrections, certificate cancellatio
 
 ## What this project does
 
-CertiFlow is a demo certificate issuance and verification application for a fictional skills programme. It includes:
+CertiFlow is a certificate issuance and verification application for a fictional skills programme. It includes:
 
 - Role-based screens for a training centre, district officers, the quality team, and state office.
 - Spreadsheet batch upload, validation, review, approval, rejection, and send-back flows.
@@ -26,7 +26,7 @@ CertiFlow is a demo certificate issuance and verification application for a fict
 
 PostgreSQL is the source of truth. Approval decisions are written in transactions that lock the batch row, and a database index prevents duplicate active decisions by the same reviewer at the same stage. Certificate and message jobs run in the background so these slower operations do not block an approval request. The WhatsApp mock stores idempotency keys in Redis and simulates failures and timeouts.
 
-This is a hackathon demo, not a production service. In particular, the local backend runs the API and workers together, and PDFs are stored in a Docker volume. The deployment proposal describes how these components could be separated and operated at scale.
+  The local backend runs the API and workers together, and PDFs are stored in a Docker volume. The deployment proposal describes how these components could be separated and operated at scale.
 
 ## Run locally
 
@@ -66,7 +66,7 @@ The automated tests cover spreadsheet validation without partial writes, duplica
 
 ## AI assistance
 
-AI tools were used during development. I reviewed the generated changes and checked them with the automated tests, TypeScript builds, Prisma validation, and a local Docker Compose startup. I will explain the implementation and its limitations during review.
+AI tools were used during some parts development. I reviewed the generated changes and checked them with the automated tests, TypeScript builds, Prisma validation, and a local Docker Compose startup. I will explain the implementation and its limitations during review.
 
 ## Known limitations
 
