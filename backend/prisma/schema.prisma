@@ -1,0 +1,204 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  CENTRE
+  DISTRICT_OFFICER
+  QUALITY_TEAM
+  STATE_OFFICE
+}
+
+enum BatchStatus {
+  DRAFT
+  PENDING_DISTRICT_REVIEW
+  DISTRICT_APPROVED
+  PENDING_QUALITY_REVIEW
+  QUALITY_APPROVED
+  PENDING_STATE_APPROVAL
+  APPROVED
+  CERTIFICATES_ISSUED
+  SENT_BACK
+  REJECTED
+}
+
+enum CertificateStatus {
+  ACTIVE
+  CANCELLED
+}
+
+enum ApprovalAction {
+  APPROVED
+  REJECTED
+  SENT_BACK
+}
+
+enum DeliveryStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+model User {
+  id           String     @id @default(uuid()) @db.Uuid
+  name         String
+  email        String     @unique
+  phone        String?
+  passwordHash String     @map("password_hash")
+  role         Role
+  districtId   String?    @map("district_id") @db.Uuid
+  centreId     String?    @map("centre_id") @db.Uuid
+  createdAt    DateTime   @default(now()) @map("created_at")
+
+  district     District?        @relation(fields: [districtId], references: [id])
+  centre       TrainingCentre?  @relation(fields: [centreId], references: [id])
+  approvals    Approval[]
+  auditLogs    AuditLog[]
+
+  @@map("users")
+}
+
+model District {
+  id      String           @id @default(uuid()) @db.Uuid
+  name    String
+  code    String           @unique
+
+  centres TrainingCentre[]
+  users   User[]
+  batches Batch[]
+
+  @@map("districts")
+}
+
+model TrainingCentre {
+  id         String   @id @default(uuid()) @db.Uuid
+  name       String
+  districtId String   @map("district_id") @db.Uuid
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  district   District @relation(fields: [districtId], references: [id])
+  users      User[]
+  batches    Batch[]
+
+  @@map("training_centres")
+}
+
+model Batch {
+  id              String      @id @default(uuid()) @db.Uuid
+  centreId        String      @map("centre_id") @db.Uuid
+  districtId      String      @map("district_id") @db.Uuid
+  title           String
+  candidateCount  Int         @default(0) @map("candidate_count")
+  status          BatchStatus @default(DRAFT)
+  version         Int         @default(1)
+  rejectionReason String?     @map("rejection_reason")
+  submittedAt     DateTime?   @map("submitted_at")
+  createdAt       DateTime    @default(now()) @map("created_at")
+  updatedAt       DateTime    @updatedAt @map("updated_at")
+
+  centre       TrainingCentre @relation(fields: [centreId], references: [id])
+  district     District       @relation(fields: [districtId], references: [id])
+  candidates   Candidate[]
+  certificates Certificate[]
+  approvals    Approval[]
+
+  @@index([status])
+  @@map("batches")
+}
+
+model Candidate {
+  id            String       @id @default(uuid()) @db.Uuid
+  batchId       String       @map("batch_id") @db.Uuid
+  name          String
+  phone         String
+  course        String
+  score         Float
+  certificateId String?      @unique @map("certificate_id") @db.Uuid
+
+  batch         Batch        @relation(fields: [batchId], references: [id])
+  certificate   Certificate? @relation(fields: [certificateId], references: [id])
+
+  @@map("candidates")
+}
+
+model Certificate {
+  id                String            @id @default(uuid()) @db.Uuid
+  certificateNumber String            @unique @map("certificate_number")
+  candidateId       String            @unique @map("candidate_id") @db.Uuid
+  batchId           String            @map("batch_id") @db.Uuid
+  status            CertificateStatus @default(ACTIVE)
+  issuedAt          DateTime          @default(now()) @map("issued_at")
+  cancelledAt       DateTime?         @map("cancelled_at")
+  cancelledBy       String?           @map("cancelled_by") @db.Uuid
+  cancelReason      String?           @map("cancel_reason")
+  pdfPath           String?           @map("pdf_path")
+
+  candidate        Candidate?        @relation
+  batch            Batch             @relation(fields: [batchId], references: [id])
+  deliveryAttempts DeliveryAttempt[]
+
+  @@index([certificateNumber])
+  @@index([status])
+  @@map("certificates")
+}
+
+model Approval {
+  id         String         @id @default(uuid()) @db.Uuid
+  batchId    String         @map("batch_id") @db.Uuid
+  userId     String         @map("user_id") @db.Uuid
+  stage      String
+  action     ApprovalAction
+  reason     String?
+  superseded Boolean        @default(false)
+  createdAt  DateTime       @default(now()) @map("created_at")
+
+  batch      Batch          @relation(fields: [batchId], references: [id])
+  user       User           @relation(fields: [userId], references: [id])
+
+  @@map("approvals")
+}
+
+model AuditLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String?  @map("user_id") @db.Uuid
+  action     String
+  entityType String   @map("entity_type")
+  entityId   String   @map("entity_id")
+  details    Json?
+  ipAddress  String?  @map("ip_address")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  user       User?    @relation(fields: [userId], references: [id])
+
+  @@map("audit_logs")
+}
+
+model DeliveryAttempt {
+  id              String         @id @default(uuid()) @db.Uuid
+  certificateId   String         @map("certificate_id") @db.Uuid
+  candidatePhone  String         @map("candidate_phone")
+  status          DeliveryStatus @default(PENDING)
+  attempts        Int            @default(0)
+  lastAttemptAt   DateTime?      @map("last_attempt_at")
+  idempotencyKey  String         @unique @map("idempotency_key")
+  error           String?
+
+  certificate     Certificate    @relation(fields: [certificateId], references: [id])
+
+  @@index([idempotencyKey])
+  @@map("delivery_attempts")
+}
+
+model CertificateSequence {
+  id           String @id @default(uuid()) @db.Uuid
+  districtCode String @unique @map("district_code")
+  year         Int
+  lastSeq      Int    @default(0) @map("last_seq")
+
+  @@map("certificate_sequences")
+}

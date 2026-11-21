@@ -1,0 +1,8 @@
+FROM node:20-alpine
+WORKDIR /app
+COPY backend/package.json backend/package-lock.json* ./
+RUN npm install
+COPY backend/src/whatsapp-mock/ ./src/whatsapp-mock/
+COPY backend/tsconfig.json .
+EXPOSE 3001
+CMD ["npx", "tsx", "src/whatsapp-mock/server.ts"]
