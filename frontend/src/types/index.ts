@@ -23,6 +23,12 @@ export enum CertificateStatus {
   CANCELLED = 'CANCELLED',
 }
 
+export enum DeliveryStatus {
+  PENDING = 'PENDING',
+  SENT = 'SENT',
+  FAILED = 'FAILED',
+}
+
 export enum ApprovalAction {
   APPROVED = 'APPROVED',
   REJECTED = 'REJECTED',
@@ -80,6 +86,27 @@ export interface Certificate {
   pdfPath?: string | null;
   candidate?: Candidate;
   batch?: Batch;
+  deliveryAttempts?: Array<{
+    id: string;
+    status: DeliveryStatus;
+    attempts: number;
+    error?: string | null;
+    lastAttemptAt?: string | null;
+  }>;
+}
+
+export interface PublicCertificateVerification {
+  valid: boolean;
+  status: CertificateStatus | 'NOT_FOUND';
+  certificate?: {
+    certificateNumber: string;
+    status: CertificateStatus;
+    issuedAt: string;
+    cancelledAt: string | null;
+    candidateName: string | null;
+    courseName: string | null;
+    trainingCentre: string;
+  };
 }
 
 export interface Approval {

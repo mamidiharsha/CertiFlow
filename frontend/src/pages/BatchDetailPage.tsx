@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { getBatch, getBatchCandidates, getBatchApprovals, getBatchAuditLog, submitBatch, approveBatch, rejectBatch, sendBackBatch } from '../api/batches';
+import { getBatch, getBatchCandidates, getBatchApprovals, getBatchAuditLog, submitBatch, approveBatch, rejectBatch, sendBackBatch, replaceBatchCandidates } from '../api/batches';
 import { useAuth } from '../context/AuthContext';
 import { UserRole, BatchStatus } from '../types';
 import type { Candidate, Approval, AuditLogEntry } from '../types';
@@ -10,6 +10,7 @@ import DataTable from '../components/DataTable';
 import ApprovalTimeline from '../components/ApprovalTimeline';
 import Modal from '../components/Modal';
 import LoadingSpinner from '../components/LoadingSpinner';
+import FileUpload from '../components/FileUpload';
 import toast from 'react-hot-toast';
 import { clsx } from 'clsx';
 import { format } from 'date-fns';
@@ -25,6 +26,7 @@ export default function BatchDetailPage() {
   const [activeTab, setActiveTab] = useState<TabKey>('candidates');
   const [modalType, setModalType] = useState<'reject' | 'sendback' | null>(null);
   const [reason, setReason] = useState('');
+  const [revisionFile, setRevisionFile] = useState<File | null>(null);
 
   const { data: batch, isLoading } = useQuery({
     queryKey: ['batch', id],
@@ -73,6 +75,24 @@ export default function BatchDetailPage() {
   const sendBackMutation = useMutation({
     mutationFn: (r: string) => sendBackBatch(id!, r),
     onSuccess: () => { toast.success('Batch sent back'); invalidate(); setModalType(null); setReason(''); },
+  });
+
+  const replaceCandidatesMutation = useMutation({
+    mutationFn: () => replaceBatchCandidates(id!, revisionFile!),
+    onSuccess: () => {
+      toast.success('Candidate list updated. Review approvals will reset when you resubmit.');
+      setRevisionFile(null);
+      invalidate();
+      queryClient.invalidateQueries({ queryKey: ['batch', id, 'candidates'] });
+    },
+    onError: (error: { response?: { data?: { error?: string; rowErrors?: Array<{ row: number; errors: Array<{ field: string; message: string }> }> } } }) => {
+      const rowErrors = error.response?.data?.rowErrors;
+      if (rowErrors?.length) {
+        toast.error(rowErrors.map((row) => `Row ${row.row}: ${row.errors.map((item) => `${item.field} ${item.message}`).join(', ')}`).join('; '));
+      } else {
+        toast.error(error.response?.data?.error ?? 'Could not update candidates');
+      }
+    },
   });
 
   if (isLoading || !batch) {
@@ -207,12 +227,34 @@ export default function BatchDetailPage() {
 
       {/* Tab content */}
       {activeTab === 'candidates' && (
-        <DataTable<Candidate>
-          columns={candidateColumns}
-          data={candidates}
-          keyExtractor={(c) => c.id}
-          emptyMessage="No candidates in this batch"
-        />
+        <>
+          {isCentre && batch.status === BatchStatus.SENT_BACK && (
+            <div className="mb-5 rounded-xl border border-orange-200 bg-orange-50 p-5">
+              <h2 className="text-sm font-semibold text-orange-900">Fix and resubmit this batch</h2>
+              <p className="my-2 text-sm text-orange-800">
+                Upload the corrected candidate spreadsheet. When you resubmit, previous approvals are retained in the audit history but superseded, and review starts again.
+              </p>
+              <FileUpload
+                onFileSelect={setRevisionFile}
+                selectedFile={revisionFile}
+                onClear={() => setRevisionFile(null)}
+              />
+              <button
+                onClick={() => replaceCandidatesMutation.mutate()}
+                disabled={!revisionFile || replaceCandidatesMutation.isPending}
+                className="mt-3 rounded-lg bg-orange-600 px-4 py-2 text-sm font-medium text-white hover:bg-orange-700 disabled:opacity-50"
+              >
+                {replaceCandidatesMutation.isPending ? 'Updating…' : 'Replace candidate list'}
+              </button>
+            </div>
+          )}
+          <DataTable<Candidate>
+            columns={candidateColumns}
+            data={candidates}
+            keyExtractor={(c) => c.id}
+            emptyMessage="No candidates in this batch"
+          />
+        </>
       )}
 
       {activeTab === 'approvals' && (

@@ -37,6 +37,11 @@ export default function Layout() {
       toast.success(`Certificate issued: ${(data as { certificateNumber?: string }).certificateNumber ?? 'New certificate'}`);
       queryClient.invalidateQueries({ queryKey: ['certificates'] });
     },
+    onMessage: () => {
+      queryClient.invalidateQueries({ queryKey: ['batches'] });
+      queryClient.invalidateQueries({ queryKey: ['batch'] });
+      queryClient.invalidateQueries({ queryKey: ['certificates'] });
+    },
   });
 
   const handleLogout = async () => {

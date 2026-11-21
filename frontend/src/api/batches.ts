@@ -21,6 +21,15 @@ export async function uploadBatch(file: File, title: string): Promise<{ success:
   return data;
 }
 
+export async function replaceBatchCandidates(id: string, file: File): Promise<Batch> {
+  const formData = new FormData();
+  formData.append('file', file);
+  const { data } = await client.put(`/batches/${id}/candidates`, formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  });
+  return data.batch ?? data;
+}
+
 export async function submitBatch(id: string): Promise<Batch> {
   const { data } = await client.post(`/batches/${id}/submit`);
   return data.batch ?? data;

@@ -48,9 +48,16 @@ export default function UploadBatchPage() {
         navigate('/batches');
       }
     },
-    onError: (error: { response?: { data?: { errors?: ValidationError[] } } }) => {
-      const validationErrors = error.response?.data?.errors;
-      if (validationErrors && validationErrors.length > 0) {
+    onError: (error: { response?: { data?: { errors?: ValidationError[]; rowErrors?: Array<{ row: number; errors: Array<{ field: string; message: string }> }> } } }) => {
+      const data = error.response?.data;
+      const validationErrors = data?.rowErrors
+        ? data.rowErrors.flatMap((row) => row.errors.map((rowError) => ({
+            row: row.row,
+            field: rowError.field,
+            message: rowError.message,
+          })))
+        : data?.errors ?? [];
+      if (validationErrors.length > 0) {
         setErrors(validationErrors);
         setPreview([]);
         setUploaded(true);

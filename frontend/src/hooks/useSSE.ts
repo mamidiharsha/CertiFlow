@@ -55,6 +55,16 @@ export function useSSE(options: SSEOptions) {
       }
     });
 
+    for (const eventName of ['certificate_cancelled', 'batch_stale', 'delivery_status_changed']) {
+      es.addEventListener(eventName, (e) => {
+        try {
+          optionsRef.current.onMessage?.(eventName, JSON.parse(e.data));
+        } catch {
+          // Ignore malformed event payloads.
+        }
+      });
+    }
+
     // Generic message handler
     es.onmessage = (e) => {
       try {

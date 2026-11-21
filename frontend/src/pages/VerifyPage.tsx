@@ -1,8 +1,8 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { useMutation } from '@tanstack/react-query';
 import { verifyCertificate } from '../api/certificates';
-import type { Certificate } from '../types';
+import type { PublicCertificateVerification } from '../types';
 import { CertificateStatus } from '../types';
 import { Search, Shield, CheckCircle2, XCircle, Award } from 'lucide-react';
 import { format } from 'date-fns';
@@ -11,7 +11,7 @@ import { clsx } from 'clsx';
 export default function VerifyPage() {
   const { certNumber: paramCertNumber } = useParams<{ certNumber?: string }>();
   const [searchInput, setSearchInput] = useState(paramCertNumber ?? '');
-  const [result, setResult] = useState<{ valid: boolean; certificate?: Certificate } | null>(null);
+  const [result, setResult] = useState<PublicCertificateVerification | null>(null);
   const [searched, setSearched] = useState(false);
 
   const verifyMutation = useMutation({
@@ -21,7 +21,7 @@ export default function VerifyPage() {
       setSearched(true);
     },
     onError: () => {
-      setResult({ valid: false });
+      setResult({ valid: false, status: 'NOT_FOUND' });
       setSearched(true);
     },
   });
@@ -33,11 +33,11 @@ export default function VerifyPage() {
   };
 
   // Auto-verify if cert number in URL
-  useState(() => {
+  useEffect(() => {
     if (paramCertNumber) {
       verifyMutation.mutate(paramCertNumber);
     }
-  });
+  }, [paramCertNumber, verifyMutation.mutate]);
 
   return (
     <div className="flex min-h-screen flex-col items-center bg-gradient-to-br from-indigo-50 via-white to-blue-50 px-4 pt-20">
@@ -74,15 +74,15 @@ export default function VerifyPage() {
       {/* Result */}
       {searched && result && (
         <div className="mt-8 w-full max-w-lg">
-          {result.valid && result.certificate ? (
+          {result.certificate ? (
             <div className={clsx(
               'rounded-xl border p-6 shadow-sm',
-              result.certificate.status === CertificateStatus.ACTIVE
+              result.valid
                 ? 'border-green-200 bg-green-50'
                 : 'border-red-200 bg-red-50'
             )}>
               <div className="flex items-center gap-3 mb-4">
-                {result.certificate.status === CertificateStatus.ACTIVE ? (
+                {result.valid ? (
                   <CheckCircle2 className="h-8 w-8 text-green-600" />
                 ) : (
                   <XCircle className="h-8 w-8 text-red-600" />
@@ -90,9 +90,9 @@ export default function VerifyPage() {
                 <div>
                   <h3 className={clsx(
                     'text-lg font-bold',
-                    result.certificate.status === CertificateStatus.ACTIVE ? 'text-green-800' : 'text-red-800'
+                    result.valid ? 'text-green-800' : 'text-red-800'
                   )}>
-                    {result.certificate.status === CertificateStatus.ACTIVE
+                    {result.valid
                       ? 'Valid Certificate'
                       : 'Cancelled Certificate'}
                   </h3>
@@ -106,19 +106,19 @@ export default function VerifyPage() {
                 <div className="flex justify-between">
                   <span className="text-sm text-gray-500">Candidate</span>
                   <span className="text-sm font-medium text-gray-900">
-                    {result.certificate.candidate?.name ?? '—'}
+                    {result.certificate.candidateName ?? '—'}
                   </span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-sm text-gray-500">Course</span>
                   <span className="text-sm font-medium text-gray-900">
-                    {result.certificate.candidate?.course ?? '—'}
+                    {result.certificate.courseName ?? '—'}
                   </span>
                 </div>
                 <div className="flex justify-between">
-                  <span className="text-sm text-gray-500">Score</span>
+                  <span className="text-sm text-gray-500">Training Centre</span>
                   <span className="text-sm font-medium text-gray-900">
-                    {result.certificate.candidate?.score ?? '—'}
+                    {result.certificate.trainingCentre}
                   </span>
                 </div>
                 <div className="flex justify-between">
@@ -132,14 +132,6 @@ export default function VerifyPage() {
                     <span className="text-sm text-gray-500">Cancelled On</span>
                     <span className="text-sm font-medium text-red-600">
                       {format(new Date(result.certificate.cancelledAt), 'MMMM d, yyyy')}
-                    </span>
-                  </div>
-                )}
-                {result.certificate.cancelReason && (
-                  <div className="flex justify-between">
-                    <span className="text-sm text-gray-500">Cancel Reason</span>
-                    <span className="text-sm font-medium text-red-600">
-                      {result.certificate.cancelReason}
                     </span>
                   </div>
                 )}

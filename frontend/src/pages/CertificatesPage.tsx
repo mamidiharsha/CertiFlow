@@ -1,10 +1,10 @@
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { listCertificates, cancelCertificate } from '../api/certificates';
+import { listCertificates, cancelCertificate, retryCertificateDelivery } from '../api/certificates';
 import DataTable from '../components/DataTable';
 import Modal from '../components/Modal';
 import LoadingSpinner from '../components/LoadingSpinner';
-import { CertificateStatus } from '../types';
+import { CertificateStatus, DeliveryStatus } from '../types';
 import type { Certificate } from '../types';
 import { format } from 'date-fns';
 import { clsx } from 'clsx';
@@ -28,6 +28,17 @@ export default function CertificatesPage() {
       queryClient.invalidateQueries({ queryKey: ['certificates'] });
       setCancelTarget(null);
       setReason('');
+    },
+  });
+
+  const retryMutation = useMutation({
+    mutationFn: retryCertificateDelivery,
+    onSuccess: () => {
+      toast.success('Delivery retry queued');
+      queryClient.invalidateQueries({ queryKey: ['certificates'] });
+    },
+    onError: (error: { response?: { data?: { error?: string } } }) => {
+      toast.error(error.response?.data?.error ?? 'Could not retry delivery');
     },
   });
 
@@ -75,6 +86,37 @@ export default function CertificatesPage() {
       render: (c: Certificate) => (
         <span className="text-gray-500">{format(new Date(c.issuedAt), 'MMM d, yyyy')}</span>
       ),
+    },
+    {
+      key: 'delivery',
+      header: 'WhatsApp delivery',
+      render: (c: Certificate) => {
+        const delivery = c.deliveryAttempts?.[0];
+        if (!delivery) return <span className="text-gray-400">Not queued</span>;
+        return (
+          <div className="flex items-center gap-2">
+            <span className={clsx(
+              'text-xs font-medium',
+              delivery.status === DeliveryStatus.SENT ? 'text-green-700' :
+                delivery.status === DeliveryStatus.FAILED ? 'text-red-700' : 'text-amber-700'
+            )}>
+              {delivery.status} ({delivery.attempts} attempts)
+            </span>
+            {delivery.status === DeliveryStatus.FAILED && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  retryMutation.mutate(c.id);
+                }}
+                disabled={retryMutation.isPending}
+                className="rounded px-2 py-1 text-xs font-medium text-indigo-600 hover:bg-indigo-50 disabled:opacity-50"
+              >
+                Retry
+              </button>
+            )}
+          </div>
+        );
+      },
     },
     {
       key: 'actions',
